@@ -110,6 +110,20 @@ Print individual observations and a final statistical summary, including median 
 `-h`\
 Show help.
 
+For accurate results, `ppsbias` needs to run on a different CPU from the one handling the PPS interrupt.
+Use
+
+```
+grep -E 'CPU|pps' /proc/interrupts
+```
+
+to see which CPU is handling the PPS interrupt. If several CPUs have non-zero counts, look for which ones increase.
+If this shows that, for example, CPU0 is handling the PPS interrupts, then use `taskset -c` to run on another CPU:
+
+```
+taskset -c 3 ppsbias -m rpi5
+```
+
 With the `-c` option, `ppsbias` cannot share the GPIO with the `pps-gpio` driver.
 If `-c` reports that the device is busy, first stop programs using its PPS devices, such as chrony or ntpd.
 Then unload the module.
