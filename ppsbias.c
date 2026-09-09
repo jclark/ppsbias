@@ -410,7 +410,8 @@ static const char *interpolate(const struct sample *left, const struct sample *o
 	return NULL;
 }
 
-static void record(const struct sample *s, const char *unavailable, bool interpolated, double bias)
+static void record(const struct sample *s, const char *unavailable, bool interpolated,
+		   double bias, int64_t unpolled_timestamp)
 {
 	if (!verbose) return;
 	if (s->event.present) timestamp("timestamp", s->event.kernel);
@@ -419,6 +420,9 @@ static void record(const struct sample *s, const char *unavailable, bool interpo
 	if (s->bracket_ok) difference("bracket", (double)s->bracket);
 	if (s->poll_status) printf(" pollStatus=%s", s->poll_status);
 	if (s->event.present && s->event.status) printf(" sourceStatus=%s", s->event.status);
+	if (unavailable || interpolated) {
+		putchar(' '); timestamp("unpolledTimestamp", unpolled_timestamp);
+	}
 	if (unavailable) printf(" unpolledStatus=%s", unavailable);
 	if (interpolated) difference("unpolledBias", bias);
 	putchar('\n'); output_ok();
@@ -648,7 +652,7 @@ int main(int argc, char **argv)
 		size_t before_count = count;
 		if (interp) values[count++] = bias;
 		if (!alternate && s.valid) values[count++] = ((double)sub(s.event.kernel, s.polled_ns) - s.polled_fraction);
-		record(&s, unavailable, interp, bias);
+		record(&s, unavailable, interp, bias, previous.event.kernel);
 		/* Continue watching the slot after immediate output. This detects extra
 		 * events and drains GPIO queues without assigning stale events to a later
 		 * slot. Roll back estimates visibly if new evidence invalidates them. */

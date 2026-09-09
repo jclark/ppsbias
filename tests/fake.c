@@ -33,6 +33,8 @@ static void advance(int64_t t)
 		if (is("sigint")) on_stop(SIGINT);
 		if (is("sigterm")) on_stop(SIGTERM);
 		if (is("step")) step = 1000000;
+		if (is("small_step")) step = 50000;
+		if (is("small_step_back")) step = -50000;
 	}
 	if (tick >= 10200000000LL && is("early_signal")) on_stop(SIGINT);
 	uint32_t value = tick % NS < NS / 2 ? 1u << 18 : 0;
@@ -132,7 +134,8 @@ int fake_ioctl(int fd, unsigned long request, ...)
 		}
 		memset(&f->info, 0, sizeof f->info);
 		f->info.assert_sequence = seq;
-		int64_t t = epoch + last_assert + bias_for(last_assert) + (is("offset") ? 2000000 : 0);
+		int64_t t = epoch + last_assert + bias_for(last_assert) +
+			(last_assert >= 15 * NS ? step : 0) + (is("offset") ? 2000000 : 0);
 		f->info.assert_tu.sec = t / NS; f->info.assert_tu.nsec = t % NS;
 		f->info.current_mode = PPS_CAPTUREASSERT | PPS_TSFMT_TSPEC;
 	} else { assert(!"unexpected ioctl (including PPS writes)"); }
@@ -160,7 +163,7 @@ ssize_t fake_read(int fd, void *buf, size_t count)
 	assert(fd == 101 && count == sizeof *e); memset(e, 0, sizeof *e);
 	e->id = GPIO_V2_LINE_EVENT_RISING_EDGE;
 	last_idx = (int)(next_edge / NS - 11);
-	e->timestamp_ns = epoch + next_edge + bias_for(next_edge);
+	e->timestamp_ns = epoch + next_edge + bias_for(next_edge) + step;
 	if ((is("extra") || is("slow_output")) && !extra_done && next_edge == 16 * NS) {
 		e->timestamp_ns = epoch + 15100000000LL; extra_done = true;
 	} else next_edge += NS;

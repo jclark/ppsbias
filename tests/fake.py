@@ -55,6 +55,9 @@ for access in (['-c', 'fake', '-g', '18'], ['-m', 'rpi3', '-p', 'fakepps'],
             assert s['mode'] == ('alternating' if alternate else 'every-pulse')
             population = [float(x['unpolledBias' if alternate else 'bias'])
                           for x in observations if ('unpolledBias' if alternate else 'bias') in x]
+            for i, observation in enumerate(observations):
+                if 'unpolledBias' in observation or 'unpolledStatus' in observation:
+                    assert observation['unpolledTimestamp'] == observations[i - 1]['timestamp']
             assert abs(float(s['mean']) - sum(population) / len(population)) < 1.1e-7
             if alternate:
                 assert observations[0].keys() == {'timestamp'}
@@ -62,9 +65,10 @@ for access in (['-c', 'fake', '-g', '18'], ['-m', 'rpi3', '-p', 'fakepps'],
             scalar = run([*args, '-t', str(duration), *mode]).stdout
             assert scalar == s['median'] + '\n'
     for scenario, expected in [('missing', 0), ('gap', 0), ('sigint', 130),
-                               ('sigterm', 143), ('early_signal', 130), ('step', 1)]:
+                               ('sigterm', 143), ('early_signal', 130), ('step', 1),
+                               ('small_step', 1), ('small_step_back', 1)]:
         result = run([*args, '-t', '8', '-v', '-e'], expected, scenario)
-        if scenario in ('early_signal', 'step'):
+        if scenario in ('early_signal', 'step', 'small_step', 'small_step_back'):
             assert 'median=' not in result.stdout
         else:
             s = summary(result)
@@ -72,6 +76,10 @@ for access in (['-c', 'fake', '-g', '18'], ['-m', 'rpi3', '-p', 'fakepps'],
                 assert int(s['sourceFailures']) >= 1
             else:
                 assert s['completion'] == ('interrupted' if scenario == 'sigint' else 'terminated')
+    for scenario in ('small_step', 'small_step_back'):
+        result = run([*args, '-t', '4', '-v'], 1, scenario)
+        assert 'clock discontinuity detected' in result.stderr
+        assert 'median=' not in result.stdout
 ioctl = [fake, '-c', 'fake', '-g', '18', '-t', '8', '-v', '-e']
 pps = [fake, '-m', 'rpi5', '-p', 'fakepps', '-t', '8', '-v', '-e']
 for scenario in ('snapshot', 'offset', 'fallback', 'fresh', 'format_default'):
