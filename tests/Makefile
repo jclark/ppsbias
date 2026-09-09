@@ -5,7 +5,7 @@ LDFLAGS =
 LDLIBS =
 PYTHON = python3
 
-PROGRAMS = unit fake
+PROGRAMS = unit fake clocks
 
 .PHONY: all check clean
 all: $(PROGRAMS)
@@ -15,6 +15,7 @@ $(PROGRAMS): %: %.c ../ppsbias.c
 
 check: all
 	./unit
+	./clocks
 	$(PYTHON) checkcli.py
 	$(PYTHON) fake.py
 

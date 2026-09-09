@@ -78,8 +78,10 @@ static void sleep_until(int64_t t)
 		if (r != EINTR) { errno = r; syserror("clock_nanosleep"); return; }
 	}
 }
-/* Realtime-minus-monotonic interval: uncertainty includes clock read latency.
- * Compare successive intervals, allowing 100 us beyond that uncertainty. */
+/* Realtime and monotonic receive the same frequency adjustments on Linux.
+ * Their offset must stay within the intersection of the measured intervals.
+ * Retain that intersection so a slow read cannot conceal a clock step between
+ * two precise reads. Allow one nanosecond for clock representation rounding. */
 struct clocks { int64_t low, high; };
 static struct clocks clocks;
 static bool have_clocks;
@@ -89,10 +91,16 @@ static int64_t check_clocks(void)
 	int64_t m0 = now(CLOCK_MONOTONIC), r = now(CLOCK_REALTIME), m1 = now(CLOCK_MONOTONIC);
 	struct clocks c = { sub(r, m1), sub(r, m0) };
 	if (m1 < m0 || (have_clocks &&
-	    (sub(c.low, clocks.high) > 100000 || sub(clocks.low, c.high) > 100000))) {
+	    (sub(c.low, clocks.high) > 1 || sub(clocks.low, c.high) > 1))) {
 		clock_failed = true; fail("clock discontinuity detected");
 	}
-	clocks = c; have_clocks = true;
+	if (!have_clocks) clocks = c;
+	else {
+		if (c.low > clocks.low) clocks.low = c.low;
+		if (c.high < clocks.high) clocks.high = c.high;
+		if (clocks.high < clocks.low) clocks.high = clocks.low;
+	}
+	have_clocks = true;
 	return add(c.low, sub(c.high, c.low) / 2);
 }
 
