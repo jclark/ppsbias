@@ -1,12 +1,12 @@
-CC ?= cc
-CPPFLAGS ?=
-CFLAGS ?= -O2 -g
-CFLAGS += -std=gnu11 -Wall -Wextra -Wpedantic
-LDFLAGS ?=
-LDLIBS ?=
-PREFIX ?= /usr/local
-BINDIR ?= $(PREFIX)/bin
-INSTALL ?= install
+CC = cc
+CPPFLAGS =
+CFLAGS = -O2 -g -std=gnu11 -Wall -Wextra -Wpedantic
+LDFLAGS =
+LDLIBS =
+export CC CPPFLAGS CFLAGS LDFLAGS LDLIBS
+PREFIX = /usr/local
+BINDIR = $(PREFIX)/bin
+INSTALL = install
 
 PROGRAMS = ppsbias ppsecho
 
@@ -20,7 +20,7 @@ ppsecho: ppsecho.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 check: all
-	python3 tests/check.py
+	$(MAKE) -C tests check
 
 install: all
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"
@@ -31,3 +31,4 @@ uninstall:
 
 clean:
 	rm -f $(PROGRAMS)
+	$(MAKE) -C tests clean

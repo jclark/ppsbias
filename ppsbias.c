@@ -1,720 +1,701 @@
 /* SPDX-License-Identifier: MIT
  * Copyright (c) 2026 James Clark
  */
-/*
- * ppsbias: estimate how late the kernel timestamps a PPS edge on a GPIO
- * line.
- *
- * For every pulse n the kernel supplies a timestamp K[n], taken in hardirq
- * context with the REALTIME clock, the same way pps-gpio does.  On the
- * even-numbered pulses the program also estimates the edge time P[n] by
- * polling the line value in a tight loop around the predicted arrival: the edge is the
- * midpoint between the last low read and the first high read, each read
- * placed at the midpoint of the clock readings around it, reducing sensitivity
- * to read duration. Read asymmetry remains a source of systematic error.
- *
- * Polling keeps the interrupt path warm (PCIe link out of L1, a CPU busy),
- * which itself changes the kernel timestamp, so the odd-numbered pulses are
- * left alone.  On an odd pulse P[n] is not measured but computed as the midpoint
- * of its neighbours, (P[n-1] + P[n+1]) / 2, assuming stable pulse spacing
- * and approximately linear clock drift over two seconds.  The bias is K[n] - P[n] on the odd pulses:
- * how late the kernel stamp is on a second when nothing is polling.
- *
- * Usage: ppsbias [-c /dev/gpiochip0] [-l 18] [-w window_us] [-m] [-p /dev/ppsN] [-j] -d seconds
- *
- * -m polls by reading the GPIO input register through /dev/gpiomem0 instead
- *    of the get-values ioctl.  Raspberry Pi 5 (RP1) only.  The read is a bare
- *    MMIO load, so the bracket is narrower and has no syscall asymmetry.  It
- *    needs no ownership of the line, so it works while pps-gpio holds it.
- * -p takes the kernel timestamps from a PPS device (PPS_FETCH) instead of
- *    GPIO edge events, measuring exactly the stamp chrony consumes.  Combine
- *    with -m, or poll a second line wired to the same pulse.
- *
- * -P polls a different line (chip:offset) from the one that supplies edge
- *    events, e.g. one wired in parallel on a GPIO block with faster reads.
- * -s spaces value reads at least that many microseconds apart (busy-wait),
- *    trading bracket width for less bus traffic around the edge.
- *
- * -j prints one JSON line per pulse to stdout as the run proceeds, with the
- *    kernel timestamp, P and K - P, instead of
- *    the plain per-pulse rows.  An odd pulse is printed once the following
- *    even pulse has been measured; it carries poll_interpolated: true.
- *    Fields without a value are omitted.  These lines use every measured
- *    neighbour; the summary additionally rejects brackets wider than four
- *    times the median.
- *
- * Rising edges only.  Per-pulse rows go to stdout, the summary to stderr.
- */
-
+/* Compare physical 1 Hz rising GPIO edges with kernel timestamps. */
 #define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <math.h>
 #include <limits.h>
+#include <linux/gpio.h>
+#include <math.h>
 #include <poll.h>
 #include <sched.h>
-#include <stdbool.h>
 #include <signal.h>
-#include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/timepps.h>
 #include <sys/prctl.h>
+#include <sys/timepps.h>
 #include <time.h>
 #include <unistd.h>
-#include <linux/gpio.h>
 
 #define NS INT64_C(1000000000)
+_Static_assert(sizeof(off_t) >= 8, "64-bit mmap offsets required");
+static volatile sig_atomic_t stopped;
+static bool fatal, clock_failed, verbose;
 
-static volatile sig_atomic_t stop_requested;
-static int pps_fd = -1;
+static void on_stop(int sig) { stopped = sig; }
 
-static void on_stop(int sig)
+static void fail(const char *msg) { fprintf(stderr, "%s\n", msg); fatal = true; }
+
+static void syserror(const char *msg) { perror(msg); fatal = true; }
+
+static int64_t add(int64_t a, int64_t b)
 {
-	(void)sig;
-	stop_requested = 1;
+	int64_t r;
+	if (__builtin_add_overflow(a, b, &r)) { fail("timestamp arithmetic overflow"); return 0; }
+	return r;
 }
 
-static int64_t now_ns(void)
+static int64_t sub(int64_t a, int64_t b)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_REALTIME, &ts);
-	return (int64_t)ts.tv_sec * NS + ts.tv_nsec;
+	int64_t r;
+	if (__builtin_sub_overflow(a, b, &r)) { fail("timestamp arithmetic overflow"); return 0; }
+	return r;
 }
+
+static int64_t timespec_ns(struct timespec t, bool offset)
+{
+	int64_t s = (int64_t)t.tv_sec, r;
+	if ((time_t)s != t.tv_sec || t.tv_nsec <= -NS || t.tv_nsec >= NS ||
+	    (!offset && (s < 0 || t.tv_nsec < 0)) || __builtin_mul_overflow(s, NS, &r)) {
+		fail("timestamp outside supported ABI/range"); return 0;
+	}
+	return add(r, t.tv_nsec);
+}
+
+static int64_t now(clockid_t id)
+{
+	struct timespec t;
+	if (clock_gettime(id, &t) < 0) { syserror("clock_gettime"); return 0; }
+	return timespec_ns(t, false);
+}
+
+static int64_t minimum(int64_t a, int64_t b) { return a < b ? a : b; }
 
 static void sleep_until(int64_t t)
 {
-	struct timespec ts = { .tv_sec = t / NS, .tv_nsec = t % NS };
+	struct timespec ts = { .tv_sec = (time_t)(t / NS), .tv_nsec = t % NS };
+	if ((int64_t)ts.tv_sec != t / NS) { fail("deadline outside time_t range"); return; }
+	while (!stopped && !fatal) {
+		int r = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+		if (!r) return;
+		if (r != EINTR) { errno = r; syserror("clock_nanosleep"); return; }
+	}
+}
+/* Realtime-minus-monotonic interval: uncertainty includes clock read latency.
+ * Compare successive intervals, allowing 100 us beyond that uncertainty. */
+struct clocks { int64_t low, high; };
+static struct clocks clocks;
+static bool have_clocks;
 
-	while (clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &ts, NULL) == EINTR)
-		if (stop_requested)
-			return;
+static int64_t check_clocks(void)
+{
+	int64_t m0 = now(CLOCK_MONOTONIC), r = now(CLOCK_REALTIME), m1 = now(CLOCK_MONOTONIC);
+	struct clocks c = { sub(r, m1), sub(r, m0) };
+	if (m1 < m0 || (have_clocks &&
+	    (sub(c.low, clocks.high) > 100000 || sub(clocks.low, c.high) > 100000))) {
+		clock_failed = true; fail("clock discontinuity detected");
+	}
+	clocks = c; have_clocks = true;
+	return add(c.low, sub(c.high, c.low) / 2);
 }
 
-enum status { ST_UNPOLLED, ST_OK, ST_EARLY, ST_NOEDGE };
+struct model { const char *name, *device, *access; uint64_t physical; size_t span; unsigned count; };
+static const struct model models[] = {
+	{ "rpi3", "/dev/gpiomem", "bcm", UINT64_C(0x3f200000), 0x1000, 54 },
+	{ "rpi4", "/dev/gpiomem", "bcm", UINT64_C(0xfe200000), 0x1000, 58 },
+	{ "rpi5", "/dev/gpiomem0", "rp1", UINT64_C(0x1f000d0000), 0x30000, 54 }
+};
+struct source {
+	int fd;
+	bool pps, have_seq, canwait;
+	uint32_t seq, line_seq;
+	int caps, mode;
+	int64_t offset;
+	void *mapping;
+	size_t map_length;
+	volatile uint32_t *level;
+	uint32_t mask;
+	const char *device;
+};
+
+static size_t register_offset(const struct model *m, unsigned gpio, uint32_t *mask)
+{
+	unsigned bit = gpio % 32;
+	size_t off = 0x34 + 4 * (gpio / 32);
+	if (!strcmp(m->access, "rp1")) {
+		unsigned bank = gpio < 28 ? 0 : gpio < 34 ? 1 : 2;
+		bit = gpio - (bank == 0 ? 0 : bank == 1 ? 28 : 34);
+		off = 0x10008 + bank * 0x4000;
+	}
+	*mask = UINT32_C(1) << bit;
+	return off;
+}
+
+static void map_registers(struct source *s, const struct model *m, unsigned gpio)
+{
+	uint64_t physical = 0;
+	long page = sysconf(_SC_PAGESIZE);
+	if (page <= 0) { fail("cannot determine page size"); return; }
+	s->device = m->device;
+	int fd = open(s->device, O_RDONLY | O_SYNC | O_CLOEXEC);
+	if (fd < 0 && errno == ENOENT) {
+		s->device = "/dev/mem"; physical = m->physical;
+		fd = open(s->device, O_RDONLY | O_SYNC | O_CLOEXEC);
+	}
+	if (fd < 0) { syserror(s->device); return; }
+	size_t displacement = physical % (uint64_t)page;
+	off_t offset = (off_t)(physical - displacement);
+	s->map_length = ((m->span + displacement + page - 1) / page) * page;
+	s->mapping = mmap(NULL, s->map_length, PROT_READ, MAP_SHARED, fd, offset);
+	if (s->mapping == MAP_FAILED) { s->mapping = NULL; syserror(s->device); }
+	if (close(fd) < 0) syserror("close memory device");
+	if (s->mapping)
+		s->level = (volatile uint32_t *)((char *)s->mapping + displacement + register_offset(m, gpio, &s->mask));
+}
+
+static void request_line(struct source *s, const char *chip, unsigned gpio)
+{
+	struct gpiochip_info info = {0};
+	struct gpio_v2_line_request req = {0};
+	int fd = open(chip, O_RDONLY | O_CLOEXEC);
+	s->device = chip;
+	if (fd < 0) { syserror(chip); return; }
+	if (ioctl(fd, GPIO_GET_CHIPINFO_IOCTL, &info) < 0) syserror("GPIO_GET_CHIPINFO_IOCTL");
+	else if (gpio >= info.lines) fail("GPIO outside chip range");
+	if (!fatal) {
+		req.offsets[0] = gpio; req.num_lines = 1; req.event_buffer_size = 16;
+		strcpy(req.consumer, "ppsbias");
+		req.config.flags = GPIO_V2_LINE_FLAG_INPUT | GPIO_V2_LINE_FLAG_EDGE_RISING | GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME;
+		if (ioctl(fd, GPIO_V2_GET_LINE_IOCTL, &req) < 0) {
+			int e = errno;
+			fprintf(stderr, "GPIO %u on %s: %s\n", gpio, chip, strerror(e));
+			if (e == EBUSY) fprintf(stderr, "GPIO %u on %s is already in use.\nIf pps-gpio owns this input, stop programs using its PPS device,\nthen unload it with: sudo modprobe -r pps_gpio\n", gpio, chip);
+			fatal = true;
+		} else s->fd = req.fd;
+	}
+	if (close(fd) < 0) syserror("close gpiochip");
+}
+
+/* Linux stores the driver's initial parameter mask verbatim. A fresh source
+ * may omit format bits even though PPS_FETCH returns timespecs. The Linux PPS
+ * API defaults an unspecified format to TSPEC; no parameter write is needed. */
+static int pps_relevant_mode(int mode)
+{
+	int format = mode & (PPS_TSFMT_TSPEC | PPS_TSFMT_NTPFP);
+	return (mode & PPS_CAPTUREASSERT) | (format ? format : PPS_TSFMT_TSPEC);
+}
+
+static void pps_parameters(struct source *s, bool initial)
+{
+	pps_params_t p;
+	if (time_pps_getparams(s->fd, &p) < 0) { syserror("PPS_GETPARAMS"); return; }
+	int relevant = pps_relevant_mode(p.mode);
+	int64_t offset = p.mode & PPS_OFFSETASSERT ? timespec_ns(p.assert_offset, true) : 0;
+	if (!(s->caps & PPS_CAPTUREASSERT) || !(s->caps & PPS_TSFMT_TSPEC) ||
+	    relevant != (PPS_CAPTUREASSERT | PPS_TSFMT_TSPEC))
+		fail("PPS requires enabled assert capture and timespec timestamps");
+	if (!initial && (relevant != pps_relevant_mode(s->mode) || offset != s->offset))
+		fail("PPS capture, format, or effective assert offset changed");
+	if (initial) { s->mode = p.mode; s->offset = offset; }
+}
+
+static void open_pps(struct source *s, const char *path)
+{
+	s->pps = true;
+	s->fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (s->fd < 0) { syserror(path); return; }
+	pps_handle_t handle;
+	if (time_pps_create(s->fd, &handle) < 0 || time_pps_getcap(s->fd, &s->caps) < 0) {
+		syserror(path); return;
+	}
+	pps_parameters(s, true);
+	s->canwait = (s->caps & PPS_CANWAIT) != 0;
+}
+
+static void cleanup(struct source *s)
+{
+	if (s->mapping && munmap(s->mapping, s->map_length) < 0) syserror("munmap");
+	/* Linux time_pps_destroy is close(handle); close exactly once, also on setup failure. */
+	if (s->fd >= 0 && close(s->fd) < 0) syserror("close timestamp source");
+}
+
+struct event { int64_t kernel, physical; bool present; const char *status; };
+
+static const char *sequence_status(uint32_t previous, uint32_t next, bool pps)
+{
+	uint32_t delta = next - previous;
+	if (delta == 1) return NULL;
+	if (!delta) return "duplicate_event";
+	if (!pps) return "gpio_queue_gap";
+	return delta <= INT32_MAX ? "pps_sequence_gap" : "sequence_reset";
+}
+
+static void decode_pps(struct source *s, const pps_info_t *info, struct event *e)
+{
+	uint32_t seq = (uint32_t)info->assert_sequence;
+	if (!s->have_seq) { s->seq = seq; s->have_seq = true; return; }
+	if (seq == s->seq) return;
+	e->status = sequence_status(s->seq, seq, true);
+	s->seq = seq;
+	e->kernel = timespec_ns(info->assert_timestamp, false);
+	e->physical = sub(e->kernel, s->offset); e->present = !fatal;
+}
+
+/* Snapshot first, including after GPIO polling. A blocking PPS_FETCH waits
+ * for a future event, not necessarily the assertion already stored by PPS. */
+static struct event next_event(struct source *s, int64_t deadline)
+{
+	struct event e = {0};
+	while (!stopped && !fatal) {
+		int64_t before = now(CLOCK_MONOTONIC);
+		bool drain = before >= deadline;
+		check_clocks();
+		if (s->pps) {
+			pps_info_t info;
+			struct timespec zero = {0};
+			pps_parameters(s, false);
+			if (fatal) break;
+			int r = time_pps_fetch(s->fd, PPS_TSFMT_TSPEC, &info, &zero);
+			if (!r) decode_pps(s, &info, &e);
+			else if (errno != EINTR && errno != ETIMEDOUT) syserror("PPS snapshot");
+			if (!e.present && !fatal && !stopped && !drain) {
+				int64_t start = now(CLOCK_MONOTONIC);
+				int64_t remain = sub(deadline, start);
+				if (remain <= 0) continue;
+				if (s->canwait) {
+					struct timespec to = { .tv_sec = (time_t)(remain / NS), .tv_nsec = remain % NS };
+					r = time_pps_fetch(s->fd, PPS_TSFMT_TSPEC, &info, &to);
+					if (!r) decode_pps(s, &info, &e);
+					else if (errno != EINTR && errno != ETIMEDOUT) syserror("PPS fetch");
+				}
+				if (!e.present && !fatal && now(CLOCK_MONOTONIC) - start < NS / 100)
+					sleep_until(minimum(add(start, NS / 100), deadline));
+			}
+			pps_parameters(s, false);
+		} else {
+			struct pollfd p = { .fd = s->fd, .events = POLLIN };
+			int64_t remain = sub(deadline, now(CLOCK_MONOTONIC));
+			if (remain <= 0) drain = true;
+			int timeout = drain ? 0 : (int)minimum((remain + 999999) / 1000000, INT_MAX);
+			int r = poll(&p, 1, timeout);
+			if (r < 0) { if (errno != EINTR) syserror("GPIO event poll"); }
+			else if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) fail("GPIO event device lost");
+			else if (r && (p.revents & POLLIN)) {
+				struct gpio_v2_line_event ev;
+				ssize_t bytes = read(s->fd, &ev, sizeof ev);
+				if (bytes < 0) { if (errno != EINTR) syserror("GPIO event read"); }
+				else if (bytes != sizeof ev) fail("short GPIO event read");
+				else if (ev.id != GPIO_V2_LINE_EVENT_RISING_EDGE || ev.timestamp_ns > INT64_MAX) fail("invalid GPIO rising event");
+				else {
+					if (s->have_seq) {
+						e.status = sequence_status(s->seq, ev.seqno, false);
+						const char *ls = sequence_status(s->line_seq, ev.line_seqno, false);
+						if (ls) e.status = ls;
+					}
+					s->seq = ev.seqno; s->line_seq = ev.line_seqno; s->have_seq = true;
+					e.kernel = e.physical = (int64_t)ev.timestamp_ns; e.present = true;
+				}
+			}
+		}
+		check_clocks();
+		if (e.present || fatal || drain) break;
+	}
+	if (fatal) e.status = clock_failed ? "clock_step" : "error";
+	return e;
+}
 
 struct sample {
-	int64_t kernel;		/* kernel edge timestamp, REALTIME ns */
-	int64_t polled;		/* polled edge estimate, or 0 */
-	int64_t bracket;	/* interval between the bracketing read instants */
-	int64_t read_ns;	/* duration of the first-high read */
-	int reads;		/* value reads in the window */
-	int events;		/* edge events consumed for this pulse */
-	enum status status;
-	int idx;		/* pulse index */
+	struct event event;
+	bool polled, bracket_ok, valid;
+	int64_t polled_ns;
+	double polled_fraction, bracket;
+	const char *poll_status;
 };
 
-static const char *status_name(enum status s)
+static void poll_window(struct source *src, int64_t center, int64_t half,
+			int64_t spacing, int64_t run_end, struct sample *s)
 {
-	switch (s) {
-	case ST_UNPOLLED: return "unpolled";
-	case ST_OK: return "ok";
-	case ST_EARLY: return "early";
-	case ST_NOEDGE: return "noedge";
-	}
-	return "?";
-}
-
-/*
- * -j output: one JSON line per pulse.  src is 'm' (P measured), 'i' (P
- * interpolated from the neighbouring measured pulses) or 0 (no P, in which
- * case only the kernel timestamp is printed).
- */
-static void emit_json(const struct sample *s, int64_t p, char src)
-{
-	printf("{\"pulse\": %d, \"kernel_ns\": %" PRId64, s->idx, s->kernel);
-	if (src) {
-		printf(", \"polled_ns\": %" PRId64, p);
-		if (src == 'i')
-			printf(", \"poll_interpolated\": true");
-		printf(", \"bias_ns\": %" PRId64, s->kernel - p);
-	}
-	if (s->status == ST_OK)
-		printf(", \"bracket_ns\": %" PRId64, s->bracket);
-	printf("}\n");
-	fflush(stdout);
-}
-
-/* Emit a held odd pulse, interpolating P from its neighbours if both were measured. */
-static void emit_pending(struct sample *samples, int pending, const struct sample *right)
-{
-	const struct sample *odd = &samples[pending];
-	const struct sample *left = pending > 0 ? &samples[pending - 1] : NULL;
-
-	if (left && right && left->status == ST_OK && right->status == ST_OK &&
-	    right->kernel - odd->kernel > NS / 2 &&
-	    right->kernel - odd->kernel < 3 * NS / 2 &&
-	    odd->kernel - left->kernel > NS / 2 &&
-	    odd->kernel - left->kernel < 3 * NS / 2 &&
-	    left->idx == odd->idx - 1 && right->idx == odd->idx + 1)
-		emit_json(odd, (left->polled + right->polled) / 2, 'i');
-	else
-		emit_json(odd, 0, 0);
-}
-
-static int request_line(const char *chip, unsigned line, int edges)
-{
-	struct gpio_v2_line_request req;
-	int cfd, r;
-
-	cfd = open(chip, O_RDONLY | O_CLOEXEC);
-	if (cfd < 0) {
-		fprintf(stderr, "open %s: %s\n", chip, strerror(errno));
-		return -1;
-	}
-	memset(&req, 0, sizeof req);
-	req.offsets[0] = line;
-	req.num_lines = 1;
-	strncpy(req.consumer, "ppsbias", sizeof req.consumer - 1);
-	req.config.flags = GPIO_V2_LINE_FLAG_INPUT;
-	if (edges)
-		req.config.flags |= GPIO_V2_LINE_FLAG_EDGE_RISING |
-				    GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME;
-	req.event_buffer_size = 16;
-	r = ioctl(cfd, GPIO_V2_GET_LINE_IOCTL, &req);
-	close(cfd);
-	if (r < 0) {
-		fprintf(stderr, "request %s line %u: %s\n", chip, line, strerror(errno));
-		return -1;
-	}
-	return req.fd;
-}
-
-static int use_mmio;
-
-static int json;
-static int poll_fd = -1;	/* line polled for values; may differ from the event line */
-static int64_t spacing;	/* minimum interval between value reads, ns */
-static int read_value_mmio(int64_t *t0, int64_t *t1);
-
-static int read_value(int64_t *t0, int64_t *t1)
-{
-	struct gpio_v2_line_values v = { .bits = 0, .mask = 1 };
-
-	if (use_mmio)
-		return read_value_mmio(t0, t1);
-	*t0 = now_ns();
-	if (ioctl(poll_fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &v) < 0)
-		return -1;
-	*t1 = now_ns();
-	return v.bits & 1;
-}
-
-/*
- * RP1 (Raspberry Pi 5) register polling through /dev/gpiomem0, which maps
- * 0x400d0000..0x400fffff: IO_BANK0..2, then SYS_RIO0..2 at +0x10000, then
- * PADS.  RIO_IN (+0x08) holds the synchronised pad inputs of one bank.
- */
-static volatile uint32_t *rio_in;
-static uint32_t rio_bit;
-
-static int map_gpiomem(const char *path, unsigned line)
-{
-	static const struct { unsigned first, count; uint32_t rio; } bank[] = {
-		{ 0, 28, 0x0000 }, { 28, 6, 0x4000 }, { 34, 20, 0x8000 },
-	};
-	unsigned b;
-	int fd;
-	void *base;
-
-	for (b = 0; b < 3; b++)
-		if (line >= bank[b].first && line < bank[b].first + bank[b].count)
-			break;
-	if (b == 3) {
-		fprintf(stderr, "line %u is not an RP1 GPIO\n", line);
-		return -1;
-	}
-	fd = open(path, O_RDONLY | O_SYNC | O_CLOEXEC);
-	if (fd < 0) {
-		fprintf(stderr, "open %s: %s\n", path, strerror(errno));
-		return -1;
-	}
-	base = mmap(NULL, 0x30000, PROT_READ, MAP_SHARED, fd, 0);
-	close(fd);
-	if (base == MAP_FAILED) {
-		fprintf(stderr, "mmap %s: %s\n", path, strerror(errno));
-		return -1;
-	}
-	rio_in = (volatile uint32_t *)((char *)base + 0x10000 + bank[b].rio + 0x08);
-	rio_bit = 1u << (line - bank[b].first);
-	return 0;
-}
-
-static int read_value_mmio(int64_t *t0, int64_t *t1)
-{
-	uint32_t v;
-
-	*t0 = now_ns();
-	__sync_synchronize();
-	v = *rio_in;
-	__sync_synchronize();
-	*t1 = now_ns();
-	return (v & rio_bit) != 0;
-}
-
-/* Kernel timestamps from a PPS device instead of GPIO edge events. */
-static pps_handle_t pps_handle;
-static uint32_t pps_seq;
-static int pps_have_seq;
-
-static int open_pps(const char *path)
-{
-	pps_fd = open(path, O_RDWR);
-	if (pps_fd < 0) {
-		fprintf(stderr, "open %s: %s\n", path, strerror(errno));
-		return -1;
-	}
-	if (time_pps_create(pps_fd, &pps_handle) < 0) {
-		fprintf(stderr, "time_pps_create %s: %s\n", path, strerror(errno));
-		return -1;
-	}
-	return 0;
-}
-
-static int read_pps(int64_t after, int64_t deadline, int64_t *ts)
-{
-	int n = 0;
-
-	for (;;) {
-		pps_info_t info;
-		struct timespec to;
-		int64_t remain = deadline - now_ns(), t;
-
-		if (remain <= 0 || stop_requested)
-			return n;
-		to.tv_sec = remain / NS;
-		to.tv_nsec = remain % NS;
-		if (time_pps_fetch(pps_handle, PPS_TSFMT_TSPEC, &info, &to) < 0) {
-			if (errno == EINTR) {
-				if (stop_requested)
-					return n;
-				continue;
-			}
-			if (errno == ETIMEDOUT)
-				return n;
-			fprintf(stderr, "time_pps_fetch: %s\n", strerror(errno));
-			return n;
-		}
-		if (pps_have_seq && info.assert_sequence == pps_seq)
-			continue;
-		if (pps_have_seq) {
-			uint32_t advance = (uint32_t)(info.assert_sequence - pps_seq);
-
-			n = advance > (uint32_t)(INT_MAX - n) ? INT_MAX : n + (int)advance;
+	int64_t offset = check_clocks();
+	int64_t lo = sub(center, half), hi = add(center, half);
+	int64_t begin = sub(lo, offset), end = minimum(sub(hi, offset), run_end);
+	int64_t previous = 0, previous_start = 0, read_at = begin;
+	double previous_fraction = 0;
+	bool have_low = false, began = false;
+	s->polled = true; s->poll_status = "no_edge";
+	sleep_until(minimum(begin, run_end));
+	check_clocks();
+	while (!stopped && !fatal) {
+		int64_t mono = now(CLOCK_MONOTONIC);
+		if (mono >= end) { if (!began) s->poll_status = "late"; break; }
+		if (mono < read_at) continue;
+		int64_t t0 = now(CLOCK_REALTIME);
+		if (t0 < lo) continue;
+		began = true;
+		if (t0 >= hi) { s->poll_status = "invalid_bracket"; break; }
+		int v;
+		if (src->level) {
+			__sync_synchronize(); v = (*src->level & src->mask) != 0; __sync_synchronize();
 		} else {
-			n = 1;
+			struct gpio_v2_line_values values = { .mask = 1 };
+			if (ioctl(src->fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &values) < 0) {
+				syserror("GPIO value read"); s->poll_status = "io_error"; break;
+			}
+			v = (values.bits & 1) != 0;
 		}
-		pps_seq = info.assert_sequence;
-		pps_have_seq = 1;
-		t = (int64_t)info.assert_timestamp.tv_sec * NS + info.assert_timestamp.tv_nsec;
-		*ts = t;
-		if (t > after)
-			return n;
+		int64_t t1 = now(CLOCK_REALTIME);
+		if (t1 < t0 || (have_low && t0 < previous_start)) {
+			clock_failed = true; fail("reversed realtime GPIO read ordering");
+			s->poll_status = "invalid_bracket"; break;
+		}
+		if (t1 > hi || (end == run_end && now(CLOCK_MONOTONIC) > run_end)) {
+			s->poll_status = "invalid_bracket"; break;
+		}
+		int64_t midpoint = add(t0, sub(t1, t0) / 2);
+		double fraction = (sub(t1, t0) % 2) * 0.5;
+		if (v) {
+			if (!have_low) s->poll_status = "initial_high";
+			else if (midpoint < previous || (midpoint == previous && fraction <= previous_fraction)) s->poll_status = "invalid_bracket";
+			else {
+				s->bracket = (double)sub(midpoint, previous) + fraction - previous_fraction;
+				double edge_delta = previous_fraction + s->bracket / 2;
+				s->polled_ns = add(previous, (int64_t)edge_delta);
+				s->polled_fraction = edge_delta - (int64_t)edge_delta;
+				s->bracket_ok = true; s->poll_status = NULL;
+			}
+			break;
+		}
+		previous = midpoint; previous_fraction = fraction; previous_start = t1; have_low = true;
+		read_at = add(mono, spacing);
 	}
+	if (stopped && !s->bracket_ok) s->poll_status = "interrupted";
+	check_clocks();
 }
 
-/*
- * Consume edge events until one with a timestamp later than `after` is
- * found or the deadline passes.  Returns the number of events consumed and
- * stores the last timestamp; 0 means none arrived.
- */
-static int read_event(int fd, int64_t after, int64_t deadline, int64_t *ts)
+static bool output_ok(void)
 {
-	int n = 0;
+	if (fflush(stdout) == EOF || ferror(stdout)) { syserror("stdout"); return false; }
+	return true;
+}
 
-	if (pps_fd >= 0)
-		return read_pps(after, deadline, ts);
-	for (;;) {
-		struct pollfd pfd = { .fd = fd, .events = POLLIN };
-		struct gpio_v2_line_event ev;
-		int64_t remain = deadline - now_ns();
-		int r;
+static void timestamp(const char *key, int64_t t)
+{
+	/* Kernel epoch values are nonnegative on supported measurement dates. */
+	printf("%s=%" PRId64 ".%09" PRId64, key, t / NS, t % NS);
+}
 
-		if (remain <= 0 || stop_requested)
-			return n;
-		r = poll(&pfd, 1, (int)(remain / 1000000) + 1);
-		if (r < 0 && errno == EINTR) {
-			if (stop_requested)
-				return n;
+static void escaped(const char *s)
+{
+	for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+		if (*p <= ' ' || *p == '%' || *p == 127) printf("%%%02X", *p);
+		else putchar(*p);
+}
+
+static void difference(const char *key, double ns) { printf(" %s=%.1fe-6", key, ns / 1000); }
+
+static const char *interpolate(const struct sample *left, const struct sample *odd,
+			      const struct sample *right, double *bias)
+{
+	if (!left || !left->event.present || !right->event.present) return "missing_neighbor";
+	if (!left->valid || !right->valid) return "invalid_neighbor";
+	if (!odd->valid) return "invalid_pairing";
+	int64_t a = sub(odd->event.physical, left->event.physical);
+	int64_t b = sub(right->event.physical, odd->event.physical);
+	if (a <= NS / 2 || a >= 3 * NS / 2 || b <= NS / 2 || b >= 3 * NS / 2) return "invalid_pairing";
+	*bias = (double)sub(odd->event.kernel, left->polled_ns) - ((double)sub(right->polled_ns, left->polled_ns) + right->polled_fraction + left->polled_fraction) / 2;
+	return NULL;
+}
+
+static void record(const struct sample *s, const char *unavailable, bool interpolated, double bias)
+{
+	if (!verbose) return;
+	if (s->event.present) timestamp("timestamp", s->event.kernel);
+	else printf("sourceStatus=%s", s->event.status);
+	if (s->polled && s->valid) difference("bias", ((double)sub(s->event.kernel, s->polled_ns) - s->polled_fraction));
+	if (s->bracket_ok) difference("bracket", (double)s->bracket);
+	if (s->poll_status) printf(" pollStatus=%s", s->poll_status);
+	if (s->event.present && s->event.status) printf(" sourceStatus=%s", s->event.status);
+	if (unavailable) printf(" unpolledStatus=%s", unavailable);
+	if (interpolated) difference("unpolledBias", bias);
+	putchar('\n'); output_ok();
+}
+
+static struct event synchronize(struct source *src, int64_t deadline, bool resync)
+{
+	int64_t offset = check_clocks(), start = now(CLOCK_MONOTONIC);
+	while (!fatal && !stopped && now(CLOCK_MONOTONIC) < deadline) {
+		struct event e = next_event(src, deadline);
+		if (!e.present) break;
+		int64_t mono = sub(e.physical, offset);
+		if (mono < start || mono >= deadline || e.status) {
+			if (verbose) { timestamp("timestamp", e.kernel); printf(" sourceStatus=%s\n", e.status ? e.status : "stale_event"); output_ok(); }
 			continue;
 		}
-		if (r <= 0)
-			return n;
-		r = read(fd, &ev, sizeof ev);
-		if (r != (int)sizeof ev) {
-			fprintf(stderr, "event read: %s\n", r < 0 ? strerror(errno) : "short");
-			return n;
-		}
-		if (ev.id != GPIO_V2_LINE_EVENT_RISING_EDGE)
-			continue;
-		n++;
-		*ts = ev.timestamp_ns;
-		if ((int64_t)ev.timestamp_ns > after)
-			return n;
+		if (resync && verbose) { timestamp("timestamp", e.kernel); printf(" resync=1\n"); output_ok(); }
+		return e;
 	}
+	return (struct event){0};
 }
+struct stats { double mean, median, sd; size_t n; };
 
-static void poll_window(int64_t center, int64_t half, struct sample *s)
+static int cmp_double(const void *a, const void *b)
 {
-	int64_t t0, t1, prev_inst = 0, deadline = center + half;
-	int prev = -1, reads = 0;
-
-	s->status = ST_NOEDGE;
-	sleep_until(center - half);
-	for (;;) {
-		int v = read_value(&t0, &t1);
-		int64_t inst;
-
-		if (v < 0) {
-			fprintf(stderr, "get values: %s\n", strerror(errno));
-			exit(1);
-		}
-		inst = t0 + (t1 - t0) / 2;
-		reads++;
-		if (prev < 0 && v) {
-			s->status = ST_EARLY;
-			break;
-		}
-		if (prev == 0 && v) {
-			s->status = ST_OK;
-			s->polled = prev_inst + (inst - prev_inst) / 2;
-			s->bracket = inst - prev_inst;
-			s->read_ns = t1 - t0;
-			break;
-		}
-		prev = v;
-		prev_inst = inst;
-		if (t1 > deadline || stop_requested)
-			break;
-		if (spacing)
-			while (!stop_requested && now_ns() < t0 + spacing)
-				;
-	}
-	s->reads = reads;
+	double x = *(const double *)a, y = *(const double *)b;
+	return (x > y) - (x < y);
 }
 
-static int cmp_i64(const void *a, const void *b)
+static struct stats compute(double *v, size_t n)
 {
-	int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
-
-	return x < y ? -1 : x > y;
+	struct stats s = { .n = n };
+	if (!n) return s;
+	for (size_t i = 0; i < n; i++) s.mean += v[i] / n;
+	for (size_t i = 0; i < n; i++) s.sd += (v[i] - s.mean) * (v[i] - s.mean);
+	if (n > 1) s.sd = sqrt(s.sd / (n - 1));
+	qsort(v, n, sizeof *v, cmp_double);
+	s.median = n % 2 ? v[n / 2] : v[n / 2 - 1] / 2 + v[n / 2] / 2;
+	return s;
 }
 
-struct stats {
-	int n;
-	double mean, sd, se, median;
-};
-
-static struct stats compute(int64_t *v, int n)
-{
-	struct stats st = { .n = n };
-	double sum = 0, sq = 0;
-	int i;
-
-	if (n == 0)
-		return st;
-	for (i = 0; i < n; i++)
-		sum += v[i];
-	st.mean = sum / n;
-	for (i = 0; i < n; i++)
-		sq += (v[i] - st.mean) * (v[i] - st.mean);
-	st.sd = n > 1 ? sqrt(sq / (n - 1)) : 0;
-	st.se = n > 1 ? st.sd / sqrt(n) : 0;
-	qsort(v, n, sizeof *v, cmp_i64);
-	st.median = n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0;
-	return st;
-}
-
-static void print_stats(const char *label, struct stats st)
-{
-	if (st.n == 0) {
-		fprintf(stderr, "%-44s n    0  unavailable\n", label);
-		return;
-	}
-	fprintf(stderr, "%-44s n %4d  mean %8.3f  median %8.3f  sd %6.3f  se %6.3f us\n",
-		label, st.n, st.mean / 1000, st.median / 1000, st.sd / 1000, st.se / 1000);
-}
-
-static int64_t number(const char *s, int64_t min, int64_t max)
+/* Integer options stay integral; timing options are rounded to nanoseconds. */
+static bool number(const char *p, uint64_t scale, uint64_t min, uint64_t max, uint64_t *out)
 {
 	char *end;
-	long long value;
-
 	errno = 0;
-	value = strtoll(s, &end, 0);
-	if (errno || !*s || *end || value < min || value > max) {
-		fprintf(stderr, "invalid numeric argument: %s\n", s);
-		exit(2);
+	if (scale > 1) {
+		double value = strtod(p, &end);
+		if (errno || end == p || *end || !isfinite(value) ||
+		    value < (double)min / scale || value > (double)max / scale) return false;
+		*out = (uint64_t)llround(value * scale);
+	} else {
+		if (*p < '0' || *p > '9') return false;
+		unsigned long long value = strtoull(p, &end, 10);
+		if (errno || *end || value < min || value > max) return false;
+		*out = value;
 	}
-	return value;
+	return true;
 }
 
-static void *allocate(size_t n, size_t size)
+static int usage(int status)
 {
-	void *p = calloc(n ? n : 1, size);
-
-	if (!p) {
-		perror("calloc");
-		exit(1);
-	}
-	return p;
+	FILE *f = status ? stderr : stdout;
+	fprintf(f, "usage: ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
+		"       ppsbias -m rpi3|rpi4|rpi5 [-p ppsdev] [-g gpio] [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
+		"  -c chip       GPIO v2 realtime rising events and values; requires -g; no -m/-p\n"
+		"  -m model      Read-only BCM (rpi3/rpi4) or RP1 (rpi5) registers\n"
+		"  -p ppsdev     PPS assert source for the same rising edge; default /dev/pps0; with -m only\n"
+		"  -g gpio       Controller GPIO number (not header pin); default 18 with -m\n"
+		"  -t seconds    Integer duration after fresh synchronization, 1..86400 (default 10)\n"
+		"  -w window_ms  Polling half-window, 0.000001..499.999 ms (default 1)\n"
+		"  -s spacing_ms Minimum read-start spacing, 0..499.999 ms (default 0)\n"
+		"                -s must be less than twice -w\n"
+		"  -e            Poll every pulse; default alternates unpolled/polled slots\n"
+		"  -v            Immediate key=value observations and expanded median summary\n"
+		"  -h            Help\n"
+		"Default stdout: median correction in seconds, e.g. 12.5e-6 (positive = late).\n");
+	if (!status && !output_ok()) return 1;
+	return status;
 }
 
-static void usage(int status)
+static void configuration(const struct source *src, const struct model *model,
+			  const char *pps, unsigned gpio, bool alternate, int64_t half, int64_t spacing)
 {
-	fprintf(status ? stderr : stdout, "usage: ppsbias [-c chip] [-l line] [-w window_us] [-m | -P chip:line] [-p ppsdev] [-s spacing_us] [-j] -d seconds\n");
-	fprintf(status ? stderr : stdout,
-		"  -c chip        GPIO chip (default /dev/gpiochip0)\n"
-		"  -l line        GPIO line offset, not header pin (default 18)\n"
-		"  -d seconds     Run duration after initial edge (required)\n"
-		"  -w window_us   Polling half-window, 1..499999 (default 1000)\n"
-		"  -s spacing_us  Minimum read spacing, 0..499999 (default 0)\n"
-		"  -m             Poll RP1 through /dev/gpiomem0 (Pi 5 only)\n"
-		"  -P chip:line   Poll a separate GPIO line; incompatible with -m\n"
-		"  -p ppsdev      Get timestamps from a PPS device\n"
-		"  -j             Emit JSON Lines instead of plain rows\n"
-		"  -h             Show help\n");
-	exit(status);
+	cpu_set_t cpus;
+	bool affinity = sched_getaffinity(0, sizeof cpus, &cpus) == 0;
+	if (!affinity) perror("sched_getaffinity (optional)");
+	if (prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL) < 0) perror("PR_SET_TIMERSLACK (optional)");
+	long slack = prctl(PR_GET_TIMERSLACK, 0UL, 0UL, 0UL, 0UL);
+	if (slack < 0) perror("PR_GET_TIMERSLACK (optional)");
+	if (!verbose) return;
+	printf("access=%s device=", model ? model->access : "ioctl"); escaped(src->device);
+	printf(" gpio=%u timestampSource=%s mode=%s", gpio, src->pps ? "pps" : "gpio", alternate ? "alternating" : "every-pulse");
+	difference("window", half); difference("spacing", spacing);
+	printf(" affinity=");
+	if (!affinity) printf("unknown");
+	else {
+		bool first = true;
+		for (int i = 0; i < CPU_SETSIZE; i++) if (CPU_ISSET(i, &cpus)) {
+			printf("%s%d", first ? "" : ",", i); first = false;
+		}
+	}
+	if (slack < 0) printf(" timerSlack=unknown"); else difference("timerSlack", slack);
+	if (model) {
+		printf(" model=%s pps=", model->name); escaped(pps);
+		printf(" ppsMode=0x%x ppsCaps=0x%x", src->mode, src->caps);
+		difference("assertOffset", src->offset);
+		printf(" ppsWait=%s", src->canwait ? "blocking" : "snapshot");
+	}
+	putchar('\n'); output_ok();
+}
+
+static void excluded(int64_t t, const char *key, const char *status)
+{
+	if (verbose) {
+		timestamp("excludedTimestamp", t); printf(" %s=%s\n", key, status); output_ok();
+	}
 }
 
 int main(int argc, char **argv)
 {
-	const char *chip = "/dev/gpiochip0", *gpiomem = "/dev/gpiomem0", *pps = NULL;
-	char *pchip = NULL;
-	unsigned line = 18, pline = 0;
-	int64_t half = 1000 * 1000;	/* 1 ms each side */
-	int duration = 0, opt, fd, i, n = 0, cap;
-	int64_t period = NS, start, prev_ts, missing = 0;
-	struct sample *samples;
-	cpu_set_t cpus;
-
-	while ((opt = getopt(argc, argv, "hc:l:w:d:mp:s:P:j")) != -1) {
+	const char *chip = NULL, *model_name = NULL, *pps = NULL;
+	const struct model *model = NULL;
+	uint64_t gpio = 18, duration = 10, half = 1000000, spacing = 0;
+	bool gpio_given = false, alternate = true;
+	int opt;
+	while ((opt = getopt(argc, argv, "hc:m:p:g:t:w:s:ev")) != -1) {
+		uint64_t *dest = NULL, scale = 1, min = 0, max = UINT32_MAX;
 		switch (opt) {
-		case 'h': usage(0); break;
+		case 'h': return usage(0);
 		case 'c': chip = optarg; break;
-		case 'm': use_mmio = 1; break;
-		case 'j': json = 1; break;
-		case 's': spacing = number(optarg, 0, 499999) * 1000; break;
+		case 'm': model_name = optarg; break;
 		case 'p': pps = optarg; break;
-		case 'P': {
-			char *colon = strrchr(optarg, ':');
-
-			if (!colon || colon == optarg)
-				usage(2);
-			*colon = 0;
-			pchip = optarg;
-			pline = number(colon + 1, 0, UINT_MAX);
+		case 'e': alternate = false; break;
+		case 'v': verbose = true; break;
+		case 'g': dest = &gpio; gpio_given = true; break;
+		case 't': dest = &duration; min = 1; max = 86400; break;
+		case 'w': dest = &half; scale = 1000000; min = 1; max = 499999000; break;
+		case 's': dest = &spacing; scale = 1000000; max = 499999000; break;
+		default: return usage(2);
+		}
+		if (dest && !number(optarg, scale, min, max, dest)) {
+			fprintf(stderr, "invalid numeric argument: %s\n", optarg); return 2;
+		}
+	}
+	if (model_name) {
+		for (size_t i = 0; i < sizeof models / sizeof models[0]; i++)
+			if (!strcmp(model_name, models[i].name)) model = &models[i];
+		if (!model) { fprintf(stderr, "unknown model: %s\n", model_name); return 2; }
+	}
+	if (optind != argc || (!!chip == !!model) ||
+	    (chip && (pps || !gpio_given || !*chip)) || (model && ((pps && !*pps) || gpio >= model->count)))
+		return usage(2);
+	if (spacing >= 2 * half) {
+		fprintf(stderr, "-s must be less than twice -w\n"); return 2;
+	}
+	if (model && !pps) pps = "/dev/pps0";
+	struct sigaction action = { .sa_handler = on_stop, .sa_flags = SA_RESTART }, ignore = { .sa_handler = SIG_IGN };
+	if (sigemptyset(&action.sa_mask) < 0 || sigemptyset(&ignore.sa_mask) < 0 ||
+	    sigaction(SIGINT, &action, NULL) < 0 || sigaction(SIGTERM, &action, NULL) < 0 ||
+	    sigaction(SIGPIPE, &ignore, NULL) < 0) { perror("signal setup"); return 1; }
+	struct source src = { .fd = -1 };
+	size_t cap = (size_t)duration + 4, count = 0, nb = 0;
+	double *values = calloc(cap, sizeof *values), *brackets = calloc(cap, sizeof *brackets);
+	if (!values || !brackets) syserror("calloc");
+	if (!fatal) {
+		if (model) { map_registers(&src, model, (unsigned)gpio); if (!fatal) open_pps(&src, pps); }
+		else request_line(&src, chip, (unsigned)gpio);
+	}
+	if (!fatal) configuration(&src, model, pps, (unsigned)gpio, alternate, half, spacing);
+	unsigned poll_failures = 0, source_failures = 0, unpolled_unavailable = 0;
+	unsigned parity = 1, missing = 0;
+	struct sample left = {0}, previous = {0};
+	bool have_left = false, have_previous = false, source_stopped = false;
+	int64_t run_end = 0, center = 0;
+	if (!fatal && !stopped) {
+		struct event sync = synchronize(&src, add(now(CLOCK_MONOTONIC), 3 * NS), false);
+		if (!sync.present && !fatal && !stopped) fail("no fresh rising assertion within 3 seconds");
+		if (sync.present) {
+			run_end = add(now(CLOCK_MONOTONIC), (int64_t)duration * NS);
+			center = add(sync.physical, NS);
+		}
+	}
+	while (!fatal && !stopped && now(CLOCK_MONOTONIC) < run_end) {
+		int64_t offset = check_clocks();
+		/* Don't create a slot whose acquisition interval hasn't begun by the end. */
+		if (sub(sub(center, NS / 2), offset) >= run_end) { sleep_until(run_end); check_clocks(); break; }
+		if (count == cap || nb == cap) {
+			if (cap > SIZE_MAX / sizeof *values / 2) { fail("sample storage size overflow"); break; }
+			size_t next_cap = cap * 2;
+			double *grown = realloc(values, next_cap * sizeof *values);
+			if (!grown) { syserror("realloc"); break; }
+			values = grown;
+			grown = realloc(brackets, next_cap * sizeof *brackets);
+			if (!grown) { syserror("realloc"); break; }
+			brackets = grown;
+			cap = next_cap;
+		}
+		struct sample s = {0};
+		if (!alternate || !(parity % 2)) poll_window(&src, center, half, spacing, run_end, &s);
+		int64_t full_end = sub(add(center, NS / 2), offset);
+		int64_t slot_end = minimum(full_end, run_end);
+		if (!fatal && !stopped) s.event = next_event(&src, slot_end);
+		if (stopped) break;
+		/* Expiry of a shortened final slot is not a source failure. */
+		if (!fatal && !stopped && !s.event.status && slot_end < full_end &&
+		    (!s.event.present || sub(s.event.physical, offset) >= run_end))
 			break;
+		if (fatal) s.event.status = clock_failed ? "clock_step" : "error";
+		else if (!s.event.present) s.event.status = "missing_event";
+		else if (!s.event.status && (s.event.physical <= sub(center, NS / 2) ||
+		         s.event.physical >= add(center, NS / 2) || sub(s.event.physical, offset) >= run_end))
+			s.event.status = s.event.physical < sub(center, NS / 2) ? "stale_event" : "timestamp_mismatch";
+		s.valid = s.event.present && !s.event.status && (!s.polled || s.bracket_ok);
+		if (s.polled && !s.bracket_ok) poll_failures++;
+		if (s.bracket_ok) brackets[nb++] = (double)s.bracket;
+		bool bad_source = s.event.status != NULL;
+		if (bad_source) source_failures++;
+		bool interp = false;
+		double bias = 0;
+		const char *unavailable = NULL;
+		if (alternate && have_previous && !previous.polled && previous.event.present) {
+			unavailable = interpolate(have_left ? &left : NULL, &previous, &s, &bias);
+			interp = unavailable == NULL;
+			if (!interp) unpolled_unavailable++;
 		}
-		case 'l': line = number(optarg, 0, UINT_MAX); break;
-		case 'w': half = number(optarg, 1, 499999) * 1000; break;
-		case 'd': duration = number(optarg, 1, INT_MAX - 16); break;
-		default: usage(2);
-		}
-	}
-	if (duration <= 0 || optind != argc || (use_mmio && pchip))
-		usage(2);
-
-	/*
-	 * Kernel stamps come from the PPS device or from edge events on the
-	 * -c/-l line.  Values are polled from the -P line if given, else through
-	 * gpiomem, else from the -c/-l line itself.
-	 */
-	fd = -1;
-	if (!pps) {
-		fd = request_line(chip, line, 1);
-		if (fd < 0)
-			return 1;
-	}
-	if (pchip) {
-		poll_fd = request_line(pchip, pline, 0);
-		if (poll_fd < 0)
-			return 1;
-	} else if (use_mmio) {
-		if (map_gpiomem(gpiomem, line) < 0)
-			return 1;
-	} else if (fd >= 0) {
-		poll_fd = fd;
-	} else {
-		poll_fd = request_line(chip, line, 0);
-		if (poll_fd < 0)
-			return 1;
-	}
-	if (pps && open_pps(pps) < 0)
-		return 1;
-	signal(SIGINT, on_stop);
-	signal(SIGTERM, on_stop);
-	prctl(PR_SET_TIMERSLACK, 1000);
-	/* Prefer the last allowed CPU; respect taskset and cpuset restrictions. */
-	if (sched_getaffinity(0, sizeof cpus, &cpus) == 0) {
-		for (i = CPU_SETSIZE - 1; i >= 0; i--)
-			if (CPU_ISSET(i, &cpus))
-				break;
-		if (i >= 0) {
-			CPU_ZERO(&cpus);
-			CPU_SET(i, &cpus);
-			if (sched_setaffinity(0, sizeof cpus, &cpus) < 0)
-				perror("sched_setaffinity");
-		}
-	}
-
-	cap = duration + 16;
-	samples = allocate(cap, sizeof *samples);
-
-	if (pchip)
-		fprintf(stderr, "kernel stamps from %s, polling %s line %u via get-values ioctl\n",
-			pps ? pps : "GPIO edge events", pchip, pline);
-	else
-		fprintf(stderr, "kernel stamps from %s, polling %s line %u via %s\n", pps ? pps : "GPIO edge events",
-			chip, line, use_mmio ? gpiomem : "get-values ioctl");
-	if (read_event(fd, 0, now_ns() + 3 * NS, &prev_ts) == 0) {
-		fprintf(stderr, "no edge within 3 s\n");
-		return 1;
-	}
-	start = prev_ts;
-	int pending = -1;	/* samples[] index of an odd pulse awaiting its right neighbour */
-
-	if (!json)
-		printf("# idx status kernel_ns polled_ns bracket_ns read_ns reads events\n");
-	for (i = 1; !stop_requested && n < cap && prev_ts - start < (int64_t)duration * NS; i++) {
-		struct sample s = { 0 };
-		int64_t center = prev_ts + period, ts = 0;
-		int ev;
-
-		if (!(i % 2))
-			poll_window(center, half, &s);
-		ev = read_event(fd, center - half, center + half + NS / 2, &ts);
-		if (ev == 0 || ts <= center - half) {
-			missing++;
-			fprintf(stderr, "pulse %d: no edge event (%s)\n", i, status_name(s.status));
-			if (json && pending >= 0) {
-				emit_pending(samples, pending, NULL);
-				pending = -1;
-			}
-			prev_ts = center;
-			continue;
-		}
-		s.kernel = ts;
-		s.events = ev;
-		s.idx = i;
-		if (!json)
-			printf("%d %s %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %d %d\n", i,
-		       status_name(s.status), s.kernel, s.polled, s.bracket, s.read_ns, s.reads, s.events);
-		samples[n++] = s;
-		if (json) {
-			if (i % 2) {
-				pending = n - 1;
-			} else {
-				if (pending >= 0)
-					emit_pending(samples, pending, &samples[n - 1]);
-				pending = -1;
-				emit_json(&samples[n - 1], s.polled, s.status == ST_OK ? 'm' : 0);
+		size_t before_count = count;
+		if (interp) values[count++] = bias;
+		if (!alternate && s.valid) values[count++] = ((double)sub(s.event.kernel, s.polled_ns) - s.polled_fraction);
+		record(&s, unavailable, interp, bias);
+		/* Continue watching the slot after immediate output. This detects extra
+		 * events and drains GPIO queues without assigning stale events to a later
+		 * slot. Roll back estimates visibly if new evidence invalidates them. */
+		bool resync = bad_source && s.event.present;
+		if (!bad_source && s.event.present && !stopped && !fatal) {
+			struct event extra = next_event(&src, slot_end);
+			if (extra.present || fatal) {
+				const char *why = fatal ? (clock_failed ? "clock_step" : "error") :
+					(extra.status ? extra.status : "multiple_events");
+				excluded(s.event.kernel, "sourceStatus", why);
+				if (interp) { excluded(previous.event.kernel, "unpolledStatus", "invalid_neighbor"); unpolled_unavailable++; }
+				count = before_count; s.valid = false; s.event.status = why;
+				source_failures++; resync = true;
 			}
 		}
-		prev_ts = ts;
-		if (n % 60 == 0)
-			fprintf(stderr, "%d pulses\n", n);
-	}
-	if (json && pending >= 0)
-		emit_pending(samples, pending, NULL);
-	fflush(stdout);
-
-	/* Analysis. */
-	{
-		int64_t *diff = allocate(n, sizeof *diff), *br = allocate(n, sizeof *br);
-		int64_t *rd = allocate(n, sizeof *rd), *bias = allocate(n, sizeof *bias);
-		bool *usable = allocate(n, sizeof *usable);
-		int64_t thresh;
-		int nd = 0, nb = 0, nr = 0, nbias = 0, early = 0, noedge = 0, polled = 0, wide = 0;
-		int multi = 0, gaps = 0;
-		struct stats sb, sd, sbias, sr;
-		int64_t reads = 0;
-
-		for (i = 0; i < n; i++) {
-			if (samples[i].status != ST_UNPOLLED) {
-				polled++;
-				reads += samples[i].reads;
-			}
-			if (samples[i].status == ST_EARLY)
-				early++;
-			if (samples[i].status == ST_NOEDGE)
-				noedge++;
-			if (samples[i].events > 1)
-				multi++;
-			if (samples[i].status == ST_OK) {
-				br[nb++] = samples[i].bracket;
-				rd[nr++] = samples[i].read_ns;
+		if (!s.event.present && slot_end == full_end && !stopped && !fatal) missing++;
+		else if (s.event.present) missing = 0;
+		if (!fatal && missing >= 3 && now(CLOCK_MONOTONIC) < run_end) {
+			source_stopped = true;
+			fail("timestamp source stopped: three consecutive missing slots");
+		}
+		if (s.event.present && !s.event.status) center = add(s.event.physical, NS);
+		else center = add(center, NS);
+		left = previous; have_left = have_previous;
+		previous = s; have_previous = true; parity++;
+		if (resync && !fatal && !stopped && now(CLOCK_MONOTONIC) < run_end) {
+			if (!previous.polled && previous.event.present) unpolled_unavailable++;
+			have_previous = have_left = false;
+			int64_t deadline = minimum(add(now(CLOCK_MONOTONIC), 3 * NS), run_end);
+			struct event sync = synchronize(&src, deadline, true);
+			if (sync.present) { center = add(sync.physical, NS); parity = 1; missing = 0; }
+			else if (!fatal && !stopped && now(CLOCK_MONOTONIC) < run_end) {
+				source_stopped = true;
+				fail("timestamp source stopped: reacquisition timed out");
 			}
 		}
-		sb = compute(br, nb);
-		sr = compute(rd, nr);
-		thresh = (int64_t)(4 * sb.median);
-
-		/* Even pulses: P[n] measured.  Reject implausibly wide brackets. */
-		for (i = 0; i < n; i++)
-			if (samples[i].status == ST_OK) {
-				if (samples[i].bracket > thresh) {
-					wide++;
-					continue;
-				}
-				usable[i] = true;
-				diff[nd++] = samples[i].kernel - samples[i].polled;
-			}
-		sd = compute(diff, nd);
-
-		/*
-		 * Odd pulses: P[n] = (P[n-1] + P[n+1]) / 2, requiring both
-		 * neighbours measured and the three kernel stamps on
-		 * consecutive periods.  Bias is K[n] - P[n].
-		 */
-		for (i = 1; i + 1 < n; i++) {
-			int64_t k0, k1, k2, pn;
-
-			if (samples[i].status != ST_UNPOLLED || !usable[i - 1] || !usable[i + 1])
-				continue;
-			k0 = (samples[i - 1].kernel - start + period / 2) / period;
-			k1 = (samples[i].kernel - start + period / 2) / period;
-			k2 = (samples[i + 1].kernel - start + period / 2) / period;
-			if (k1 != k0 + 1 || k2 != k1 + 1 ||
-			    samples[i - 1].idx != samples[i].idx - 1 ||
-			    samples[i + 1].idx != samples[i].idx + 1) {
-				gaps++;
-				continue;
-			}
-			pn = (samples[i - 1].polled + samples[i + 1].polled) / 2;
-			bias[nbias++] = samples[i].kernel - pn;
-		}
-		sbias = compute(bias, nbias);
-
-		fprintf(stderr, "\n%s line %u, %s stamps, %s polling, %d pulses over %" PRId64 " s, window +/- %" PRId64 " us, spacing %" PRId64 " us\n",
-			chip, line, pps ? "PPS" : "edge-event", use_mmio ? "gpiomem" : "ioctl", n,
-			(prev_ts - start) / NS, half / 1000, spacing / 1000);
-		fprintf(stderr, "polled seconds %d: ok %d, early %d, noedge %d, wide-bracket rejected %d; "
-			"unpolled %d; missing events %" PRId64 "; multi-event pulses %d; grid gaps %d\n",
-			polled, nb, early, noedge, wide, n - polled, missing, multi, gaps);
-		if (polled)
-			fprintf(stderr, "value reads per polled window: %.0f\n", (double)reads / polled);
-		print_stats("value read duration (first-high read)", sr);
-		print_stats("edge bracket", sb);
-		print_stats("K - P, polled seconds (path kept warm)", sd);
-		print_stats("K - P, unpolled seconds (P interpolated)", sbias);
-		free(diff);
-		free(br);
-		free(rd);
-		free(bias);
-		free(usable);
 	}
-	free(samples);
-	if (poll_fd >= 0 && poll_fd != fd)
-		close(poll_fd);
-	if (fd >= 0)
-		close(fd);
-	if (pps_fd >= 0)
-		time_pps_destroy(pps_handle);
-	return 0;
+	if (alternate && have_previous && !previous.polled && previous.event.present) unpolled_unavailable++;
+	bool have_result = count && (!fatal || source_stopped);
+	cleanup(&src);
+	int result = fatal ? 1 : stopped ? 128 + stopped : count ? 0 : 3;
+	if (!fatal && !stopped && !count) fprintf(stderr, "no usable estimates; require matching physical rising GPIO/PPS edges at 1 Hz\n");
+	if (have_result) {
+		struct stats stats = compute(values, count);
+		if (!verbose) printf("%.1fe-6\n", stats.median / 1000);
+		else {
+			printf("median=%.1fe-6", stats.median / 1000); difference("mean", stats.mean);
+			printf(" samples=%zu mode=%s completion=%s", count, alternate ? "alternating" : "every-pulse",
+			       fatal ? "failed" : stopped == SIGINT ? "interrupted" : stopped == SIGTERM ? "terminated" : "complete");
+			if (count > 1) difference("stddev", stats.sd);
+			if (nb) { struct stats b = compute(brackets, nb); difference("bracketMedian", b.median); difference("bracketMax", brackets[nb - 1]); }
+			printf(" pollFailures=%u sourceFailures=%u unpolledUnavailable=%u\n", poll_failures, source_failures, unpolled_unavailable);
+		}
+		if (!output_ok()) result = 1;
+	}
+	free(values); free(brackets);
+	return result;
 }

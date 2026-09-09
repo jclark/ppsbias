@@ -1,177 +1,134 @@
-# ppsbias
+# Estimating Linux PPS bias
 
-Two small Linux tools for investigating GPIO pulse-per-second (PPS) timing:
+This repository contains tools to help estimate the systematic bias in kernel PPS timestamps under Linux.
+By bias I mean the delay between the occurrence of the pulse and the time reported by the kernel through a `/dev/ppsN` device.
+This bias will translate into inaccuracy in a stratum 1 NTP server using the PPS device as a reference clock.
+On modern Raspberry Pis, this bias is typically of the order of 10 µs.
+Note that the NTP daemon has no means to detect this inaccuracy and will not be able to report it.
+However, NTP daemons can be configured to correct for the bias.
+My [blog post](https://satpulse.net/2026/09/06/measuring-systematic-pps-bias-on-the-raspberry-pi-5.html) has more background.
 
-- **ppsbias** estimates the delay between a rising GPIO edge and its kernel
-  timestamp, using GPIO value polling as a reference. It alternates polled and
-  unpolled seconds to estimate bias when the poller is inactive.
-- **ppsecho** enables a PPS device's assert echo until interrupted, for use with
-  an external time interval counter.
+The main program is `ppsbias` which estimates the bias by comparing the kernel PPS timestamps with the time of the pulse estimated by polling the GPIO.
 
-These are measurement tools for a stable **1 Hz, rising-edge** signal.
-`ppsbias` does not adjust the system clock or calibrate a time daemon.
-GPIO ioctl polling is the general Linux path; direct register polling is
-specific to Raspberry Pi 5's RP1 and its `/dev/gpiomem0` mapping.
+The program has been tested most extensively on a Raspberry Pi 5,
+with the estimates produced by the program being confirmed by two independent methods:
 
-## Build and install
+- using the PPS echo feature, together with an external time interval counter,
+  and bpftrace to estimate the post timestamp part of the measured interval
+- comparing the kernel timestamps with a system clock synchronized from the Raspberry Pi 5's PTP hardware clock (PHC),
+  with the PHC synchronized via PTP to a PTP grandmaster connected by a back-to-back link
 
-You need a C compiler, make, Linux GPIO v2 headers, and `sys/timepps.h`
-(from pps-tools). No libgpiod library is required.
-On Debian / Raspberry Pi OS, the build dependencies can be installed with:
+The program has also been confirmed to run on a Raspberry Pi 4 and Raspberry Pi 3B.
+
+The systematic bias is often caused by wakeup latency on the platform I/O path.
+Polling can itself affect this by keeping the hardware awake.
+`ppsbias` avoids this by polling every other pulse
+and estimating the bias from the timestamps of the pulses that are not polled.
+
+In addition to `ppsbias`, there is also a tiny program `ppsecho` which enables the PPS echo feature:
+this is for estimating bias with an external time interval counter such as a tinyGTC.
+
+The code was written with AI assistance (Claude Fable 5.1 and Codex GPT 6 Astra).
+
+## Build
 
 ```sh
 sudo apt install build-essential linux-libc-dev pps-tools
 make
-./ppsbias -h
-./ppsecho -h
-```
-
-Optional installation (defaults to `/usr/local/bin`):
-
-```sh
 sudo make install
-# sudo make uninstall
 ```
 
-`CC`, `CPPFLAGS`, `CFLAGS`, `LDFLAGS`, `LDLIBS`, `PREFIX`, `BINDIR`, and
-`DESTDIR` can be overridden. `make clean` removes the binaries.
-`make check` runs hardware-free CLI, statistics, and interpolation checks;
-it additionally requires Python 3.
+`make check` runs tests without hardware (requires Python 3).
 
-## Measure with ppsbias
+## ppsbias usage
 
-Use GPIO **line offsets**, not physical header pin numbers. Identify the GPIO
-chip and offset for your board before running. Access requires appropriate
-permissions on the devices; the examples use `sudo`.
+`ppsbias` outputs the median bias in seconds, suitable for chrony's PPS refclock `offset` option.
+The result should always be positive meaning the timestamp is late: `12.7e-6` means 12.7 µs.
 
-For a GPIO line that is not already claimed by a driver:
+Normal usage is to specify the `-m` option with the model of computer being used e.g.
 
-```sh
-sudo ./ppsbias -c /dev/gpiochip0 -l 18 -d 120 > pulses.txt 2> summary.txt
+```
+ppsbias -m rpi5
 ```
 
-This requests a rising-edge input with realtime event timestamps and polls
-its value through the GPIO character-device API. The line must support
-GPIO v2 realtime edge events.
+The other values allowed for `-m` are `rpi4` and `rpi3`.
+This assumes that PPS is on pin 12 (GPIO 18) and that the PPS device is `/dev/pps0`.
+It will perform the estimate for 10 seconds.
+The `-v` verbose option will show more information. `-t 60` will run for 60 seconds.
 
-To measure timestamps from an existing PPS device on a Pi 5:
-
-```sh
-sudo ./ppsbias -m -l 18 -p /dev/pps0 -d 120 -j > pulses.jsonl 2> summary.txt
-```
-
-Here `/dev/pps0` must timestamp the same signal as RP1 GPIO 18. `-m` reads
-RP1 input registers through `/dev/gpiomem0`, without requesting ownership
-of the line. It assumes the RP1 register layout and mapping; use it only on
-that hardware. Some kernels do not provide that device. There is no
-`/dev/mem` fallback.
-
-Alternatively, wire the same signal to a second, free GPIO line and use
-`-P /dev/gpiochipN:OFFSET` to poll it. This can be combined with `-p` or
-with GPIO event timestamps on the `-c`/`-l` line. `-P` and `-m` are mutually
-exclusive. With `-p` alone, the polling line still needs to be free; a line
-owned by `pps-gpio` cannot also be requested by this program.
-
-| Option | Meaning | Default |
-| --- | --- | --- |
-| `-c chip` | GPIO chip for event capture / ordinary polling | `/dev/gpiochip0` |
-| `-l line` | GPIO offset; RP1 offset when using `-m` | `18` |
-| `-d seconds` | Duration after acquiring the initial edge | required |
-| `-w window_us` | Half-width of the polling window, 1–499999 µs | `1000` |
-| `-s spacing_us` | Minimum time between read starts, 0–499999 µs | `0` |
-| `-m` | Poll RP1 through `/dev/gpiomem0` | off |
-| `-P chip:line` | Poll a separate GPIO input | off |
-| `-p ppsdev` | Use PPS assert timestamps instead of GPIO events | off |
-| `-j` | JSON Lines output | off |
-| `-h` | Help | |
-
-Ctrl-C or SIGTERM ends collection and prints the available summary.
-The program first waits up to three seconds for an edge. It attempts to pin
-itself to the highest-numbered CPU in its allowed affinity mask; use
-`taskset` to select a different CPU. IRQ affinity is not changed. Keep the
-poller and the input interrupt on different CPUs when investigating their
-interaction, and record the configuration with your results.
-
-## Method and interpretation
-
-Let `K[n]` be the kernel timestamp for pulse `n`. On even-numbered pulses,
-`ppsbias` brackets the transition between the last low GPIO read and the
-first high read. Each read is assigned the midpoint of the realtime clock
-readings around it; the midpoint between those read instants is the edge
-estimate `P[n]`.
-
-On odd-numbered pulses, the program does not poll. It estimates:
+The full command line syntax is as follows.
 
 ```text
-P[n] = (P[n-1] + P[n+1]) / 2
-bias[n] = K[n] - P[n]
+ppsbias -m model [-p ppsdev] [-g gpio] [-t seconds] [-e] [-v] [-w ms] [-s ms]
+ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w ms] [-s ms]
 ```
 
-Positive bias means the kernel timestamp is later than the estimated edge.
-Interpolation assumes stable pulse spacing and approximately linear clock
-drift over the two-second interval. Polling can affect CPU and bus activity,
-so the summary reports polled and unpolled seconds separately.
+Either `-m` or `-c` must be specified.
+`-m` is preferred: it reads GPIO registers while the PPS driver supplies timestamps.
+It is specific to Raspberry Pi hardware.
+`-c` is the portable backup, using GPIO ioctl reads and GPIO-event timestamps.
+The events take a similar interrupt path to PPS, giving an order-of-magnitude estimate; `-m` measures the actual PPS timestamps and usually gives tighter polling brackets.
 
-The summary rejects measured brackets wider than four times the median.
-Unpolled estimates require usable measurements on both adjacent pulses and
-consecutive positions on the one-second timestamp grid. Empty statistics
-are reported as unavailable. Summary times are in microseconds; `sd` is
-sample standard deviation and `se` is `sd / sqrt(n)`.
+`-m` *model*\
+Read GPIO registers for `rpi3`, `rpi4` or `rpi5`.
 
-This is an estimate, not an absolute calibration. GPIO read asymmetry,
-register synchronisation, source jitter, and polling-induced changes can
-bias it. Standard error does not include these systematic effects or
-account for correlated samples. Clock steps invalidate the time model and
-can disrupt scheduling; avoid stepping the clock during a run. A configured
-PPS assert offset is included in fetched timestamps. GPIO event timestamps
-and PPS timestamps follow different kernel paths, so use `-p` to examine the
-PPS timestamps consumed by a time daemon.
+`-p` *ppsdev*\
+Read PPS assert timestamps from *ppsdev*.
+The default is `/dev/pps0`.
+Requires `-m`.
+The timestamps must represent the same GPIO's rising edge.
 
-### Output
+`-c` *chip*\
+Read values and realtime rising-edge events from a GPIO v2 character device.
+Requires `-g` and a free GPIO.
+Cannot be combined with `-m` or `-p`.
 
-Plain stdout starts with:
+`-g` *gpio*\
+GPIO number within the controller, not a physical header pin number.
+The default with `-m` is 18.
 
-```text
-# idx status kernel_ns polled_ns bracket_ns read_ns reads events
-```
+`-t` *seconds*\
+Measure for the specified duration after initial synchronization.
+The default is 10; an integer from 1 to 86400 is accepted.
 
-`status` is `unpolled`, `ok`, `early` (first read was already high), or
-`noedge` (no transition found in the window). Zero polling fields on
-unsuccessful or unpolled rows are placeholders. Missing kernel events are
-reported on stderr and have no stdout row. `events` counts consumed GPIO
-events or the PPS sequence advance, not a complete event history.
+`-e`\
+Poll every pulse instead of alternating polled and unpolled pulses.
 
-With `-j`, stdout contains one JSON object per captured pulse. `pulse` and
-`kernel_ns` are always present. `polled_ns` and `bias_ns` are included when
-an edge estimate is available; interpolated estimates also include
-`"poll_interpolated": true`. Successful measured pulses include
-`bracket_ns`. Odd pulses are held until the following pulse arrives, so
-output can be delayed by a second. Boundary pulses may have no estimate.
-JSON estimates are emitted before the summary's wide-bracket filtering.
-Timestamps and differences in both stdout formats are integer nanoseconds.
-Use a JSON reader that preserves 64-bit integers for epoch timestamps.
+`-w` *ms*\
+Set the polling window either side of the predicted edge.
+*ms* is a floating point number in milliseconds.
+The default is 1.
 
-## Enable PPS echo
+`-s` *ms*\
+Set the minimum interval between the starts of GPIO reads, in milliseconds.
+*ms* is a floating point number in milliseconds.
+The default is 0.
+
+`-v`\
+Print individual observations and a final statistical summary, including median and maximum polling brackets.
+
+`-h`\
+Show help.
+
+With the `-c` option, `ppsbias` cannot share the GPIO with the `pps-gpio` driver.
+If `-c` reports that the device is busy, first stop programs using its PPS devices, such as chrony or ntpd.
+Then unload the module.
 
 ```sh
-sudo ./ppsecho /dev/pps0
+sudo modprobe -r pps_gpio
 ```
 
-The PPS device must advertise `PPS_ECHOASSERT`, and its driver and board
-configuration must provide an echo output. This tool only enables the PPS
-mode bit; it does not configure GPIO pins or device-tree overlays.
+After using `ppsbias`, reload with:
 
-SIGINT (Ctrl-C) or SIGTERM restores the previous assert-echo setting while
-preserving other current PPS parameters. Avoid simultaneous echo controllers:
-the mode is shared device state. SIGKILL and crashes cannot perform cleanup.
+```
+sudo modprobe pps_gpio
+```
 
-Feed a common PPS signal to the board and an external counter, and measure
-the echo output against that signal. Use electrically compatible signal
-levels and a common ground. The measured round trip includes the input
-interrupt path, kernel work after timestamping, and output propagation.
-An echo handled in an IRQ thread can also include thread scheduling delay;
-the raw echo interval is not the PPS timestamp bias.
+## ppsecho usage
 
-## License
+```sh
+sudo ppsecho /dev/pps0
+```
 
-MIT. See [LICENSE](LICENSE).
+The PPS driver must support assert echo and have an echo output pin configured.
+ppsecho enables echo until Ctrl-C or SIGTERM, then disables it if it was not already enabled.

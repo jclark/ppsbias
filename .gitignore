@@ -1,4 +1,11 @@
 /ppsbias
 /ppsecho
+/tests/unit
+/tests/fake
 *.o
 __pycache__/
+
+# Local hardware measurements are not committed.
+/measurements/
+/PLAN.md
+/VALIDATION.md
