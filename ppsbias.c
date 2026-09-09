@@ -697,13 +697,17 @@ int main(int argc, char **argv)
 	if (!fatal && !stopped && !count) fprintf(stderr, "no usable estimates; require matching physical rising GPIO/PPS edges at 1 Hz\n");
 	if (have_result) {
 		struct stats stats = compute(values, count);
+		struct stats b = compute(brackets, nb);
+		if (nb && b.median > 1500)
+			fprintf(stderr, "warning: median polling bracket is %.3f us (above 1.5 us); bias estimate may be inaccurate\n"
+				"  try taskset -c to run on a CPU other than the PPS interrupt CPU\n", b.median / 1000);
 		if (!verbose) printf("%.1fe-6\n", stats.median / 1000);
 		else {
 			printf("median=%.1fe-6", stats.median / 1000); difference("mean", stats.mean);
 			printf(" samples=%zu mode=%s completion=%s", count, alternate ? "alternating" : "every-pulse",
 			       fatal ? "failed" : stopped == SIGINT ? "interrupted" : stopped == SIGTERM ? "terminated" : "complete");
 			if (count > 1) difference("stddev", stats.sd);
-			if (nb) { struct stats b = compute(brackets, nb); difference("bracketMedian", b.median); difference("bracketMax", brackets[nb - 1]); }
+			if (nb) { difference("bracketMedian", b.median); difference("bracketMax", brackets[nb - 1]); }
 			printf(" pollFailures=%u sourceFailures=%u unpolledUnavailable=%u\n", poll_failures, source_failures, unpolled_unavailable);
 		}
 		if (!output_ok()) result = 1;

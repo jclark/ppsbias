@@ -112,9 +112,28 @@ r = run([arg for arg in ioctl if arg != '-e'] + ['-t', '6'], 3, 'missing')
 assert 'bracket=' in r.stdout and 'sourceStatus=missing_event' in r.stdout
 r = run([*ioctl, '-s', '0.5'])
 assert float(summary(r)['bracketMax']) > .0004  # valid wide brackets are retained
+# Warn on the median, in both output modes, without changing success or stdout.
+for access in (['-c', 'fake', '-g', '18'], ['-m', 'rpi5']):
+    for mode in ([], ['-e']):
+        for spacing in ('0.0014', '0.0015', '0.0016', '0.01'):
+            args = [fake, *access, *mode, '-t', '4', '-s', spacing]
+            detailed = run([*args, '-v'])
+            scalar = run(args)
+            s = summary(detailed)
+            assert scalar.stdout == s['median'] + '\n'
+            assert scalar.stderr == detailed.stderr
+            if float(spacing) > .0015:
+                assert 'warning' in detailed.stderr.lower() and 'taskset' in detailed.stderr, detailed
+                reported_us = [float(value) for value in
+                               re.findall(r'(\d+(?:\.\d+)?)\s*(?:us|µs)', detailed.stderr)]
+                median_us = float(s['bracketMedian']) * 1e6
+                assert any(abs(value - median_us) < .001 for value in reported_us), detailed
+            else:
+                assert not detailed.stderr, detailed
 r = run(ioctl, scenario='wide')
 s = summary(r)
 assert float(s['bracketMax']) > 100 * float(s['bracketMedian']) and s['samples'] == '8'
+assert not r.stderr  # One broad bracket does not trigger a median warning.
 r = run(ioctl, scenario='late_read')
 assert 'pollStatus=invalid_bracket' in r.stdout
 with open('/dev/full', 'w') as full:
