@@ -1,4 +1,4 @@
-# Estimating Linux PPS bias
+# Estimating and correcting Linux GPIO PPS bias
 
 This repository contains tools to help estimate the systematic bias in kernel PPS timestamps under Linux.
 By bias I mean the delay between the occurrence of the pulse and the time reported by the kernel through a `/dev/ppsN` device.
@@ -42,7 +42,7 @@ sudo make install
 
 ## ppsbias usage
 
-`ppsbias` outputs the median bias in seconds, suitable for chrony's PPS refclock `offset` option.
+`ppsbias` outputs the median bias in seconds suitable for use in an NTP daemon configuration file.
 The result should always be positive meaning the timestamp is late: `12.7e-6` means 12.7 µs.
 
 Normal usage is to specify the `-m` option with the model of computer being used e.g.
@@ -137,6 +137,28 @@ After using `ppsbias`, reload with:
 ```
 sudo modprobe pps_gpio
 ```
+
+The configuration syntax depends on the NTP implementation.
+With chrony it looks like:
+
+```
+refclock PPS /dev/pps0 offset 12.7e-6
+```
+
+With NTPSec:
+
+```
+refclock pps unit 0 time1 12.7e-6
+```
+
+With classic ntpd:
+
+
+```
+server 127.127.22.0
+fudge 127.127.22.0 time1 12.7e-6
+```
+
 
 ## ppsecho usage
 
