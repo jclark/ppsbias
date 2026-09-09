@@ -2,6 +2,7 @@
 /ppsecho
 /tests/unit
 /tests/fake
+/tests/clocks
 *.o
 __pycache__/
 
@@ -9,3 +10,5 @@ __pycache__/
 /measurements/
 /PLAN.md
 /VALIDATION.md
+/INVESTIGATION.md
+
