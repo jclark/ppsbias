@@ -4,9 +4,13 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 
 root = Path(__file__).resolve().parent.parent
 fake = str(Path(__file__).resolve().with_suffix(''))
+fixture = tempfile.TemporaryDirectory()
+subprocess.run([str(Path(__file__).resolve().parent / 'fixture.sh'), fixture.name], check=True)
+os.environ['PPSBIAS_TEST_ROOT'] = fixture.name
 
 def run(args, expected=0, scenario=None, **kwargs):
     env = {**os.environ, 'PPSBIAS_TEST': scenario or ''}
@@ -32,6 +36,19 @@ for model in ('rpi3', 'rpi4', 'rpi5'):
     override = run([*args, '-p', '/dev/pps1'])
     assert rows(override)[0]['pps'] == '/dev/pps1'
     assert summary(default) == summary(override)
+# The GPIO comes from the PPS device's device tree unless -g is given.
+for model in ('rpi3', 'rpi4', 'rpi5'):
+    first = rows(run([fake, '-m', model, '-t', '4', '-v']))[0]
+    assert first['gpio'] == '18' and first['gpioSource'] == 'devicetree', first
+    first = rows(run([fake, '-m', model, '-t', '4', '-v', '-g', '18']))[0]
+    assert first['gpioSource'] == 'option', first
+r = run([fake, '-m', 'rpi5', '-p', 'ppslow', '-t', '1'], 1)
+assert 'active low' in r.stderr and not r.stdout, r
+with tempfile.TemporaryDirectory() as empty:
+    os.environ['PPSBIAS_TEST_ROOT'] = empty
+    r = run([fake, '-m', 'rpi5', '-t', '4', '-v'])
+    os.environ['PPSBIAS_TEST_ROOT'] = fixture.name
+    assert rows(r)[0]['gpioSource'] == 'default' and 'assuming GPIO 18' in r.stderr, r
 for access in (['-c', 'fake', '-g', '18'], ['-m', 'rpi3', '-p', 'fakepps'],
                ['-m', 'rpi4', '-p', 'fakepps'], ['-m', 'rpi5', '-p', 'fakepps']):
     args = [fake, *access]

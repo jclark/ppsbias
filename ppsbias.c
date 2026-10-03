@@ -13,6 +13,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,12 +105,93 @@ static int64_t check_clocks(void)
 	return add(c.low, sub(c.high, c.low) / 2);
 }
 
-struct model { const char *name, *device, *access; uint64_t physical; size_t span; unsigned count; };
+/* symbol: the device-tree __symbols__ label of the GPIO controller whose registers are read. */
+struct model { const char *name, *device, *access, *symbol; uint64_t physical; size_t span; unsigned count; };
 static const struct model models[] = {
-	{ "rpi3", "/dev/gpiomem", "bcm", UINT64_C(0x3f200000), 0x1000, 54 },
-	{ "rpi4", "/dev/gpiomem", "bcm", UINT64_C(0xfe200000), 0x1000, 58 },
-	{ "rpi5", "/dev/gpiomem0", "rp1", UINT64_C(0x1f000d0000), 0x30000, 54 }
+	{ "rpi3", "/dev/gpiomem", "bcm", "gpio", UINT64_C(0x3f200000), 0x1000, 54 },
+	{ "rpi4", "/dev/gpiomem", "bcm", "gpio", UINT64_C(0xfe200000), 0x1000, 58 },
+	{ "rpi5", "/dev/gpiomem0", "rp1", "rp1_gpio", UINT64_C(0x1f000d0000), 0x30000, 54 }
 };
+static const char *dt_root = "/proc/device-tree", *sys_root = "/sys";
+
+/* snprintf that reports truncation as failure. */
+static bool format(char *buf, size_t cap, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static bool format(char *buf, size_t cap, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(buf, cap, fmt, ap);
+	va_end(ap);
+	return n >= 0 && (size_t)n < cap;
+}
+
+/* Read a whole small file with stdio; returns its length, or -1. */
+static long read_file(const char *path, char *buf, size_t cap)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f) return -1;
+	size_t n = fread(buf, 1, cap, f);
+	bool bad = ferror(f) || (n == cap && fgetc(f) != EOF);
+	fclose(f);
+	return bad ? -1 : (long)n;
+}
+
+static uint32_t be32(const char *p)
+{
+	const unsigned char *u = (const unsigned char *)p;
+	return (uint32_t)u[0] << 24 | (uint32_t)u[1] << 16 | (uint32_t)u[2] << 8 | u[3];
+}
+
+/* Phandle of the device-tree node at a path read from a file such as __symbols__/gpio. */
+static bool node_phandle(const char *ref, char *node, size_t cap, uint32_t *phandle)
+{
+	char path[PATH_MAX], cell[4];
+	long n = read_file(ref, node, cap - 1);
+	if (n <= 1 || node[0] != '/') return false;
+	node[n] = 0;
+	if (!format(path, sizeof path, "%s%s/phandle", dt_root, node) || read_file(path, cell, sizeof cell) != 4)
+		return false;
+	*phandle = be32(cell);
+	return true;
+}
+
+/* The GPIO specifier of a pps-gpio device: ppsN name -> platform device -> gpios property.
+ * Returns NULL on success, else why not; *hard means -g cannot help. */
+static const char *pps_gpio(const char *pps, uint32_t *phandle, uint32_t *line, bool *hard)
+{
+	char real[PATH_MAX], path[PATH_MAX], name[128], spec[16];
+	const char *dev = realpath(pps, real) ? real : pps;
+	const char *base = strrchr(dev, '/') ? strrchr(dev, '/') + 1 : dev;
+	long n = -1;
+	if (format(path, sizeof path, "%s/class/pps/%s/name", sys_root, base))
+		n = read_file(path, name, sizeof name - 1);
+	if (n <= 0) return "cannot read the PPS device name";
+	name[n] = 0;
+	name[strcspn(name, "\n")] = 0;
+	char *dot = strrchr(name, '.'); /* pps-gpio names itself "<device>.<id>" */
+	if (dot) *dot = 0;
+	if (!format(path, sizeof path, "%s/bus/platform/devices/%s/of_node/gpios", sys_root, name) ||
+	    read_file(path, spec, sizeof spec) != 12)
+		return "PPS device has no device-tree GPIO";
+	if (be32(spec + 8) & 1) { *hard = true; return "PPS GPIO is active low"; }
+	*phandle = be32(spec); *line = be32(spec + 4);
+	return NULL;
+}
+
+/* Map a GPIO specifier to this model's -g numbering. */
+static const char *model_gpio(const struct model *m, uint32_t phandle, uint32_t line, uint64_t *gpio, bool *hard)
+{
+	char ref[PATH_MAX], node[PATH_MAX];
+	uint32_t controller;
+	if (!format(ref, sizeof ref, "%s/__symbols__/%s", dt_root, m->symbol) ||
+	    !node_phandle(ref, node, sizeof node, &controller))
+		return "cannot identify the GPIO controller in the device tree";
+	*hard = true;
+	if (controller != phandle) return "PPS GPIO is not on the controller this model reads";
+	if (line >= m->count) return "PPS GPIO is outside the controller range";
+	*gpio = line;
+	return NULL;
+}
 struct source {
 	int fd;
 	bool pps, have_seq, canwait;
@@ -491,7 +573,8 @@ static int usage(int status)
 		"  -c chip       GPIO v2 realtime rising events and values; requires -g; no -m/-p\n"
 		"  -m model      Read-only BCM (rpi3/rpi4) or RP1 (rpi5) registers\n"
 		"  -p ppsdev     PPS assert source for the same rising edge; default /dev/pps0; with -m only\n"
-		"  -g gpio       Controller GPIO number (not header pin); default 18 with -m\n"
+		"  -g gpio       Controller GPIO number (not header pin); with -m the default is\n"
+		"                the PPS device's GPIO from the device tree, else 18\n"
 		"  -t seconds    Integer duration after fresh synchronization, 1..86400 (default 10)\n"
 		"  -w window_ms  Polling half-window, 0.000001..499.999 ms (default 1)\n"
 		"  -s spacing_ms Minimum read-start spacing, 0..499.999 ms (default 0)\n"
@@ -504,8 +587,8 @@ static int usage(int status)
 	return status;
 }
 
-static void configuration(const struct source *src, const struct model *model,
-			  const char *pps, unsigned gpio, bool alternate, int64_t half, int64_t spacing)
+static void configuration(const struct source *src, const struct model *model, const char *pps,
+			  unsigned gpio, const char *gpio_source, bool alternate, int64_t half, int64_t spacing)
 {
 	cpu_set_t cpus;
 	bool affinity = sched_getaffinity(0, sizeof cpus, &cpus) == 0;
@@ -515,7 +598,9 @@ static void configuration(const struct source *src, const struct model *model,
 	if (slack < 0) perror("PR_GET_TIMERSLACK (optional)");
 	if (!verbose) return;
 	printf("access=%s device=", model ? model->access : "ioctl"); escaped(src->device);
-	printf(" gpio=%u timestampSource=%s mode=%s", gpio, src->pps ? "pps" : "gpio", alternate ? "alternating" : "every-pulse");
+	printf(" gpio=%u", gpio);
+	if (gpio_source) printf(" gpioSource=%s", gpio_source);
+	printf(" timestampSource=%s mode=%s", src->pps ? "pps" : "gpio", alternate ? "alternating" : "every-pulse");
 	difference("window", half); difference("spacing", spacing);
 	printf(" affinity=");
 	if (!affinity) printf("unknown");
@@ -580,6 +665,19 @@ int main(int argc, char **argv)
 		fprintf(stderr, "-s must be less than twice -w\n"); return 2;
 	}
 	if (model && !pps) pps = "/dev/pps0";
+	const char *gpio_source = model ? "option" : NULL;
+	if (model && !gpio_given) {
+		uint32_t phandle = 0, line = 0;
+		bool hard = false;
+		const char *why = pps_gpio(pps, &phandle, &line, &hard);
+		if (!why) why = model_gpio(model, phandle, line, &gpio, &hard);
+		if (!why) gpio_source = "devicetree";
+		else if (hard) { fprintf(stderr, "%s: %s\n", pps, why); return 1; }
+		else {
+			fprintf(stderr, "%s: %s; assuming GPIO %" PRIu64 "\n", pps, why, gpio);
+			gpio_source = "default";
+		}
+	}
 	struct sigaction action = { .sa_handler = on_stop, .sa_flags = SA_RESTART }, ignore = { .sa_handler = SIG_IGN };
 	if (sigemptyset(&action.sa_mask) < 0 || sigemptyset(&ignore.sa_mask) < 0 ||
 	    sigaction(SIGINT, &action, NULL) < 0 || sigaction(SIGTERM, &action, NULL) < 0 ||
@@ -592,7 +690,7 @@ int main(int argc, char **argv)
 		if (model) { map_registers(&src, model, (unsigned)gpio); if (!fatal) open_pps(&src, pps); }
 		else request_line(&src, chip, (unsigned)gpio);
 	}
-	if (!fatal) configuration(&src, model, pps, (unsigned)gpio, alternate, half, spacing);
+	if (!fatal) configuration(&src, model, pps, (unsigned)gpio, gpio_source, alternate, half, spacing);
 	unsigned poll_failures = 0, source_failures = 0, unpolled_unavailable = 0;
 	unsigned parity = 1, missing = 0;
 	struct sample left = {0}, previous = {0};

@@ -52,7 +52,9 @@ ppsbias -m rpi5
 ```
 
 The other values allowed for `-m` are `rpi4` and `rpi3`.
-This assumes that PPS is on pin 12 (GPIO 18) and that the PPS device is `/dev/pps0`.
+This assumes that the PPS device is `/dev/pps0`.
+`ppsbias` finds which GPIO that PPS device uses from the device tree,
+so it works whichever pin the `pps-gpio` overlay was given.
 It will perform the estimate for 10 seconds.
 The `-v` verbose option will show more information. `-t 60` will run for 60 seconds.
 
@@ -85,7 +87,8 @@ Cannot be combined with `-m` or `-p`.
 
 `-g` *gpio*\
 GPIO number within the controller, not a physical header pin number.
-The default with `-m` is 18.
+With `-m` the default is the GPIO of the PPS device, taken from the device tree;
+if that cannot be determined, `ppsbias` warns and assumes 18 (pin 12).
 
 `-t` *seconds*\
 Measure for the specified duration after initial synchronization.

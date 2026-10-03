@@ -196,5 +196,11 @@ int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	scenario = getenv("PPSBIAS_TEST");
+	/* fake.py builds a synthetic device tree with fixture.sh. */
+	static char dt[PATH_MAX], sys[PATH_MAX];
+	const char *root = getenv("PPSBIAS_TEST_ROOT");
+	assert(root);
+	snprintf(dt, sizeof dt, "%s/dt", root); snprintf(sys, sizeof sys, "%s/sys", root);
+	dt_root = dt; sys_root = sys;
 	return ppsbias_main(argc, argv);
 }
