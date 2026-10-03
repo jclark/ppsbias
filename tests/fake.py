@@ -42,6 +42,18 @@ for model in ('rpi3', 'rpi4', 'rpi5'):
     assert first['gpio'] == '18' and first['gpioSource'] == 'devicetree', first
     first = rows(run([fake, '-m', model, '-t', '4', '-v', '-g', '18']))[0]
     assert first['gpioSource'] == 'option', first
+# rk35xx: bank controllers from the gpioN aliases, read through /dev/mem.
+r = run([fake, '-m', 'rk35xx', '-p', 'ppsrk', '-t', '4', '-v'], 0, 'rk')
+first = rows(r)[0]
+assert first['access'] == 'rk35xx' and first['device'] == '/dev/mem', first
+assert first['gpio'] == '18' and first['gpioSource'] == 'devicetree', first
+assert 'median' in summary(r) and not r.stderr, r
+r = run([fake, '-m', 'rk35xx', '-p', 'ppsrk', '-t', '4'], 1, 'rk_v1')
+assert 'unsupported Rockchip GPIO controller version' in r.stderr, r
+r = run([fake, '-m', 'rk35xx', '-p', 'fakepps', '-t', '4'], 1, 'rk')
+assert 'gpioN' in r.stderr, r
+r = run([fake, '-m', 'rk35xx', '-p', 'nosuchpps', '-t', '4'], 1, 'rk')
+assert 'use -g' in r.stderr, r
 r = run([fake, '-m', 'rpi5', '-p', 'ppslow', '-t', '1'], 1)
 assert 'active low' in r.stderr and not r.stdout, r
 with tempfile.TemporaryDirectory() as empty:

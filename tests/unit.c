@@ -32,6 +32,25 @@ int main(void)
 	assert(register_offset(&models[1], 57, &mask) == 0x38 && mask == (1u << 25));
 	assert(register_offset(&models[2], 28, &mask) == 0x14008 && mask == 1);
 	assert(register_offset(&models[2], 53, &mask) == 0x18008 && mask == (1u << 19));
+	assert(register_offset(&models[3], 99, &mask) == 0x70 && mask == (1u << 3));
+	/* rk35xx bank lookup against the synthetic device tree from fixture.sh. */
+	char root[] = "/tmp/ppsbias-unit-XXXXXX", cmd[256], dt[64], sys[64];
+	assert(mkdtemp(root));
+	snprintf(cmd, sizeof cmd, "./fixture.sh %s", root);
+	assert(system(cmd) == 0);
+	snprintf(dt, sizeof dt, "%s/dt", root); snprintf(sys, sizeof sys, "%s/sys", root);
+	dt_root = dt; sys_root = sys;
+	uint64_t base = 0, gpio = 0;
+	uint32_t phandle = 0, line = 0;
+	bool hard = false;
+	assert(rk_bank(3, &base, &phandle) && base == UINT64_C(0xfe760000) && phandle == 0x53);
+	assert(rk_bank(0, &base, &phandle) && base == UINT64_C(0xfdd60000) && phandle == 0x22);
+	assert(!rk_bank(1, &base, &phandle));
+	assert(!pps_gpio("ppsrk3", &phandle, &line, &hard) && phandle == 0x53 && line == 3);
+	assert(!model_gpio(&models[3], phandle, line, &gpio, &hard) && gpio == 99);
+	assert(model_gpio(&models[3], 7, 18, &gpio, &hard));
+	snprintf(cmd, sizeof cmd, "rm -r %s", root);
+	assert(system(cmd) == 0);
 	char *output = NULL;
 	size_t output_size = 0;
 	FILE *saved_stdout = stdout;

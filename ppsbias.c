@@ -105,12 +105,14 @@ static int64_t check_clocks(void)
 	return add(c.low, sub(c.high, c.low) / 2);
 }
 
-/* symbol: the device-tree __symbols__ label of the GPIO controller whose registers are read. */
+/* symbol: the device-tree __symbols__ label of the GPIO controller whose registers are read;
+ * NULL for rk35xx, which has one controller per 32-line bank, found through the gpioN aliases. */
 struct model { const char *name, *device, *access, *symbol; uint64_t physical; size_t span; unsigned count; };
 static const struct model models[] = {
 	{ "rpi3", "/dev/gpiomem", "bcm", "gpio", UINT64_C(0x3f200000), 0x1000, 54 },
 	{ "rpi4", "/dev/gpiomem", "bcm", "gpio", UINT64_C(0xfe200000), 0x1000, 58 },
-	{ "rpi5", "/dev/gpiomem0", "rp1", "rp1_gpio", UINT64_C(0x1f000d0000), 0x30000, 54 }
+	{ "rpi5", "/dev/gpiomem0", "rp1", "rp1_gpio", UINT64_C(0x1f000d0000), 0x30000, 54 },
+	{ "rk35xx", "/dev/mem", "rk35xx", NULL, 0, 0x100, 320 }
 };
 static const char *dt_root = "/proc/device-tree", *sys_root = "/sys";
 
@@ -155,6 +157,21 @@ static bool node_phandle(const char *ref, char *node, size_t cap, uint32_t *phan
 	return true;
 }
 
+/* Base address and phandle of the Rockchip controller for a bank, via its gpioN alias. */
+static bool rk_bank(unsigned bank, uint64_t *base, uint32_t *phandle)
+{
+	char ref[PATH_MAX], node[PATH_MAX], path[PATH_MAX], cells[16];
+	if (!format(ref, sizeof ref, "%s/aliases/gpio%u", dt_root, bank) ||
+	    !node_phandle(ref, node, sizeof node, phandle) ||
+	    !format(path, sizeof path, "%s%s/reg", dt_root, node))
+		return false;
+	long n = read_file(path, cells, sizeof cells);
+	if (n == 16) *base = (uint64_t)be32(cells) << 32 | be32(cells + 4);
+	else if (n == 8) *base = be32(cells);
+	else return false;
+	return true;
+}
+
 /* The GPIO specifier of a pps-gpio device: ppsN name -> platform device -> gpios property.
  * Returns NULL on success, else why not; *hard means -g cannot help. */
 static const char *pps_gpio(const char *pps, uint32_t *phandle, uint32_t *line, bool *hard)
@@ -183,6 +200,18 @@ static const char *model_gpio(const struct model *m, uint32_t phandle, uint32_t 
 {
 	char ref[PATH_MAX], node[PATH_MAX];
 	uint32_t controller;
+	if (!m->symbol) {
+		for (unsigned bank = 0; bank < m->count / 32; bank++) {
+			uint64_t base;
+			if (rk_bank(bank, &base, &controller) && controller == phandle) {
+				*hard = true;
+				if (line >= 32) return "PPS GPIO is outside the controller range";
+				*gpio = bank * 32 + line;
+				return NULL;
+			}
+		}
+		return "cannot find the PPS GPIO controller among the gpioN device-tree aliases";
+	}
 	if (!format(ref, sizeof ref, "%s/__symbols__/%s", dt_root, m->symbol) ||
 	    !node_phandle(ref, node, sizeof node, &controller))
 		return "cannot identify the GPIO controller in the device tree";
@@ -209,7 +238,8 @@ static size_t register_offset(const struct model *m, unsigned gpio, uint32_t *ma
 {
 	unsigned bit = gpio % 32;
 	size_t off = 0x34 + 4 * (gpio / 32);
-	if (!strcmp(m->access, "rp1")) {
+	if (!strcmp(m->access, "rk35xx")) off = 0x70; /* GPIO_EXT_PORT of the bank's controller */
+	else if (!strcmp(m->access, "rp1")) {
 		unsigned bank = gpio < 28 ? 0 : gpio < 34 ? 1 : 2;
 		bit = gpio - (bank == 0 ? 0 : bank == 1 ? 28 : 34);
 		off = 0x10008 + bank * 0x4000;
@@ -223,9 +253,14 @@ static void map_registers(struct source *s, const struct model *m, unsigned gpio
 	uint64_t physical = 0;
 	long page = sysconf(_SC_PAGESIZE);
 	if (page <= 0) { fail("cannot determine page size"); return; }
+	bool rk = !strcmp(m->access, "rk35xx");
+	if (rk) {
+		uint32_t phandle;
+		if (!rk_bank(gpio / 32, &physical, &phandle)) { fail("no device-tree gpioN alias for the GPIO's bank"); return; }
+	}
 	s->device = m->device;
 	int fd = open(s->device, O_RDONLY | O_SYNC | O_CLOEXEC);
-	if (fd < 0 && errno == ENOENT) {
+	if (fd < 0 && errno == ENOENT && !rk) {
 		s->device = "/dev/mem"; physical = m->physical;
 		fd = open(s->device, O_RDONLY | O_SYNC | O_CLOEXEC);
 	}
@@ -238,6 +273,14 @@ static void map_registers(struct source *s, const struct model *m, unsigned gpio
 	if (close(fd) < 0) syserror("close memory device");
 	if (s->mapping)
 		s->level = (volatile uint32_t *)((char *)s->mapping + displacement + register_offset(m, gpio, &s->mask));
+	if (s->mapping && rk) {
+		/* GPIO_EXT_PORT is at 0x70 only in GPIO v2 (RK35xx); v1 has no version register. */
+		uint32_t version = *(volatile uint32_t *)((char *)s->mapping + displacement + 0x78);
+		if (version != UINT32_C(0x01000c2b) && version != UINT32_C(0x0101157c) && version != UINT32_C(0x010219c8)) {
+			fprintf(stderr, "unsupported Rockchip GPIO controller version 0x%08" PRIx32 "\n", version);
+			fatal = true;
+		}
+	}
 }
 
 static void request_line(struct source *s, const char *chip, unsigned gpio)
@@ -569,12 +612,13 @@ static int usage(int status)
 {
 	FILE *f = status ? stderr : stdout;
 	fprintf(f, "usage: ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
-		"       ppsbias -m rpi3|rpi4|rpi5 [-p ppsdev] [-g gpio] [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
+		"       ppsbias -m rpi3|rpi4|rpi5|rk35xx [-p ppsdev] [-g gpio] [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
 		"  -c chip       GPIO v2 realtime rising events and values; requires -g; no -m/-p\n"
-		"  -m model      Read-only BCM (rpi3/rpi4) or RP1 (rpi5) registers\n"
+		"  -m model      Read-only BCM (rpi3/rpi4), RP1 (rpi5) or Rockchip GPIO v2 (rk35xx) registers\n"
 		"  -p ppsdev     PPS assert source for the same rising edge; default /dev/pps0; with -m only\n"
 		"  -g gpio       Controller GPIO number (not header pin); with -m the default is\n"
-		"                the PPS device's GPIO from the device tree, else 18\n"
+		"                the PPS device's GPIO from the device tree, else 18;\n"
+		"                rk35xx numbers GPIOs bank*32+line and has no default\n"
 		"  -t seconds    Integer duration after fresh synchronization, 1..86400 (default 10)\n"
 		"  -w window_ms  Polling half-window, 0.000001..499.999 ms (default 1)\n"
 		"  -s spacing_ms Minimum read-start spacing, 0..499.999 ms (default 0)\n"
@@ -672,7 +716,9 @@ int main(int argc, char **argv)
 		const char *why = pps_gpio(pps, &phandle, &line, &hard);
 		if (!why) why = model_gpio(model, phandle, line, &gpio, &hard);
 		if (!why) gpio_source = "devicetree";
-		else if (hard) { fprintf(stderr, "%s: %s\n", pps, why); return 1; }
+		else if (hard || !model->symbol) { /* rk35xx has no conventional default */
+			fprintf(stderr, "%s: %s%s\n", pps, why, hard ? "" : "; use -g"); return 1;
+		}
 		else {
 			fprintf(stderr, "%s: %s; assuming GPIO %" PRIu64 "\n", pps, why, gpio);
 			gpio_source = "default";

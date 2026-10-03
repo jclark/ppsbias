@@ -51,7 +51,8 @@ Normal usage is to specify the `-m` option with the model of computer being used
 ppsbias -m rpi5
 ```
 
-The other values allowed for `-m` are `rpi4` and `rpi3`.
+The other values allowed for `-m` are `rpi4`, `rpi3` and `rk35xx`
+(Rockchip SoCs with the GPIO v2 controller, such as the RK3566 on the Radxa ZERO 3).
 This assumes that the PPS device is `/dev/pps0`.
 `ppsbias` finds which GPIO that PPS device uses from the device tree,
 so it works whichever pin the `pps-gpio` overlay was given.
@@ -67,12 +68,15 @@ ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w ms] [-s ms]
 
 Either `-m` or `-c` must be specified.
 `-m` is preferred: it reads GPIO registers while the PPS driver supplies timestamps.
-It is specific to Raspberry Pi hardware.
+It is specific to Raspberry Pi and Rockchip RK35xx hardware.
 `-c` is the portable backup, using GPIO ioctl reads and GPIO-event timestamps.
 The events take a similar interrupt path to PPS, giving an order-of-magnitude estimate; `-m` measures the actual PPS timestamps and usually gives tighter polling brackets.
 
 `-m` *model*\
-Read GPIO registers for `rpi3`, `rpi4` or `rpi5`.
+Read GPIO registers for `rpi3`, `rpi4`, `rpi5` or `rk35xx`.
+`rk35xx` reads the Rockchip GPIO v2 input register through `/dev/mem`,
+taking each bank's controller from the `gpioN` aliases in the device tree,
+and refuses to run if the controller is not GPIO v2.
 
 `-p` *ppsdev*\
 Read PPS assert timestamps from *ppsdev*.
@@ -88,7 +92,10 @@ Cannot be combined with `-m` or `-p`.
 `-g` *gpio*\
 GPIO number within the controller, not a physical header pin number.
 With `-m` the default is the GPIO of the PPS device, taken from the device tree;
-if that cannot be determined, `ppsbias` warns and assumes 18 (pin 12).
+if that cannot be determined, `ppsbias` warns and assumes 18 (pin 12),
+except with `rk35xx`, which has no conventional default and requires `-g`.
+With `rk35xx` the number is *bank* × 32 + *line*, as in Rockchip pinout tables:
+GPIO3_A3 is 3 × 32 + 3 = 99 (bank letters A–D are lines 0–7, 8–15, 16–23, 24–31).
 
 `-t` *seconds*\
 Measure for the specified duration after initial synchronization.

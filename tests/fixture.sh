@@ -16,3 +16,19 @@ echo 'ppslow.-1' > sys/class/pps/ppslow/name
 { cell 7; cell 18; cell 1; } > dt/ppslow/gpios
 ln -s ../../../../../dt/pps sys/bus/platform/devices/pps@12/of_node
 ln -s ../../../../../dt/ppslow sys/bus/platform/devices/ppslow/of_node
+# Rockchip GPIO v2 banks 0 and 3 (aliases gpio0, gpio3); ppsrk is line 18 of bank 0,
+# ppsrk3 is line 3 of bank 3 (GPIO3_A3 = 99).
+mkdir -p dt/aliases dt/pinctrl/gpio@fdd60000 dt/pinctrl/gpio@fe760000 dt/ppsrk dt/ppsrk3
+printf '/pinctrl/gpio@fdd60000\0' > dt/aliases/gpio0
+printf '/pinctrl/gpio@fe760000\0' > dt/aliases/gpio3
+{ cell 0; cell 0xfdd60000; cell 0; cell 0x100; } > dt/pinctrl/gpio@fdd60000/reg
+{ cell 0; cell 0xfe760000; cell 0; cell 0x100; } > dt/pinctrl/gpio@fe760000/reg
+cell 0x22 > dt/pinctrl/gpio@fdd60000/phandle
+cell 0x53 > dt/pinctrl/gpio@fe760000/phandle
+{ cell 0x22; cell 18; cell 0; } > dt/ppsrk/gpios
+{ cell 0x53; cell 3; cell 0; } > dt/ppsrk3/gpios
+for dev in ppsrk ppsrk3; do
+	mkdir -p sys/class/pps/$dev sys/bus/platform/devices/$dev
+	echo "$dev.-1" > sys/class/pps/$dev/name
+	ln -s ../../../../../dt/$dev sys/bus/platform/devices/$dev/of_node
+done
