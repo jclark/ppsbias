@@ -615,10 +615,9 @@ static int usage(int status)
 		"       ppsbias -m rpi3|rpi4|rpi5|rk35xx [-p ppsdev] [-g gpio] [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
 		"  -c chip       GPIO v2 realtime rising events and values; requires -g; no -m/-p\n"
 		"  -m model      Read-only BCM (rpi3/rpi4), RP1 (rpi5) or Rockchip GPIO v2 (rk35xx) registers\n"
-		"  -p ppsdev     PPS assert source for the same rising edge; default /dev/pps0; with -m only\n"
+		"  -p ppsdev     pps-gpio device for assert timestamps; default /dev/pps0; with -m only\n"
 		"  -g gpio       Controller GPIO number (not header pin); with -m the default is\n"
-		"                the PPS device's GPIO from the device tree, else 18;\n"
-		"                rk35xx numbers GPIOs bank*32+line and has no default\n"
+		"                the PPS device's GPIO from the device tree\n"
 		"  -t seconds    Integer duration after fresh synchronization, 1..86400 (default 10)\n"
 		"  -w window_ms  Polling half-window, 0.000001..499.999 ms (default 1)\n"
 		"  -s spacing_ms Minimum read-start spacing, 0..499.999 ms (default 0)\n"
@@ -675,7 +674,7 @@ int main(int argc, char **argv)
 {
 	const char *chip = NULL, *model_name = NULL, *pps = NULL;
 	const struct model *model = NULL;
-	uint64_t gpio = 18, duration = 10, half = 1000000, spacing = 0;
+	uint64_t gpio = 0, duration = 10, half = 1000000, spacing = 0;
 	bool gpio_given = false, alternate = true;
 	int opt;
 	while ((opt = getopt(argc, argv, "hc:m:p:g:t:w:s:ev")) != -1) {
@@ -715,14 +714,8 @@ int main(int argc, char **argv)
 		bool hard = false;
 		const char *why = pps_gpio(pps, &phandle, &line, &hard);
 		if (!why) why = model_gpio(model, phandle, line, &gpio, &hard);
-		if (!why) gpio_source = "devicetree";
-		else if (hard || !model->symbol) { /* rk35xx has no conventional default */
-			fprintf(stderr, "%s: %s%s\n", pps, why, hard ? "" : "; use -g"); return 1;
-		}
-		else {
-			fprintf(stderr, "%s: %s; assuming GPIO %" PRIu64 "\n", pps, why, gpio);
-			gpio_source = "default";
-		}
+		if (why) { fprintf(stderr, "%s: %s%s\n", pps, why, hard ? "" : "; use -g"); return 1; }
+		gpio_source = "devicetree";
 	}
 	struct sigaction action = { .sa_handler = on_stop, .sa_flags = SA_RESTART }, ignore = { .sa_handler = SIG_IGN };
 	if (sigemptyset(&action.sa_mask) < 0 || sigemptyset(&ignore.sa_mask) < 0 ||

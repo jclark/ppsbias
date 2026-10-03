@@ -58,9 +58,9 @@ r = run([fake, '-m', 'rpi5', '-p', 'ppslow', '-t', '1'], 1)
 assert 'active low' in r.stderr and not r.stdout, r
 with tempfile.TemporaryDirectory() as empty:
     os.environ['PPSBIAS_TEST_ROOT'] = empty
-    r = run([fake, '-m', 'rpi5', '-t', '4', '-v'])
+    r = run([fake, '-m', 'rpi5', '-t', '4', '-v'], 1)
     os.environ['PPSBIAS_TEST_ROOT'] = fixture.name
-    assert rows(r)[0]['gpioSource'] == 'default' and 'assuming GPIO 18' in r.stderr, r
+    assert 'use -g' in r.stderr and not r.stdout, r
 for access in (['-c', 'fake', '-g', '18'], ['-m', 'rpi3', '-p', 'fakepps'],
                ['-m', 'rpi4', '-p', 'fakepps'], ['-m', 'rpi5', '-p', 'fakepps']):
     args = [fake, *access]

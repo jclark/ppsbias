@@ -18,7 +18,7 @@ with the estimates produced by the program being confirmed by two independent me
 - comparing the kernel timestamps with a system clock synchronized from the Raspberry Pi 5's PTP hardware clock (PHC),
   with the PHC synchronized via PTP to a PTP grandmaster connected by a back-to-back link
 
-The program has also been confirmed to run on a Raspberry Pi 4 and Raspberry Pi 3B.
+The program has also been confirmed to run on a Raspberry Pi 4, a Raspberry Pi 3B and a Radxa ZERO 3E (RK3566).
 
 The systematic bias is often caused by wakeup latency on the platform I/O path.
 Polling can itself affect this by keeping the hardware awake.
@@ -51,11 +51,7 @@ Normal usage is to specify the `-m` option with the model of computer being used
 ppsbias -m rpi5
 ```
 
-The other values allowed for `-m` are `rpi4`, `rpi3` and `rk35xx`
-(Rockchip SoCs with the GPIO v2 controller, such as the RK3566 on the Radxa ZERO 3).
-This assumes that the PPS device is `/dev/pps0`.
-`ppsbias` finds which GPIO that PPS device uses from the device tree,
-so it works whichever pin the `pps-gpio` overlay was given.
+The other values allowed for `-m` are `rpi4`, `rpi3` and `rk35xx`.
 It will perform the estimate for 10 seconds.
 The `-v` verbose option will show more information. `-t 60` will run for 60 seconds.
 
@@ -74,15 +70,12 @@ The events take a similar interrupt path to PPS, giving an order-of-magnitude es
 
 `-m` *model*\
 Read GPIO registers for `rpi3`, `rpi4`, `rpi5` or `rk35xx`.
-`rk35xx` reads the Rockchip GPIO v2 input register through `/dev/mem`,
-taking each bank's controller from the `gpioN` aliases in the device tree,
-and refuses to run if the controller is not GPIO v2.
 
 `-p` *ppsdev*\
 Read PPS assert timestamps from *ppsdev*.
 The default is `/dev/pps0`.
 Requires `-m`.
-The timestamps must represent the same GPIO's rising edge.
+*ppsdev* must be a GPIO PPS device.
 
 `-c` *chip*\
 Read values and realtime rising-edge events from a GPIO v2 character device.
@@ -92,10 +85,10 @@ Cannot be combined with `-m` or `-p`.
 `-g` *gpio*\
 GPIO number within the controller, not a physical header pin number.
 With `-m` the default is the GPIO of the PPS device, taken from the device tree;
-if that cannot be determined, `ppsbias` warns and assumes 18 (pin 12),
-except with `rk35xx`, which has no conventional default and requires `-g`.
-With `rk35xx` the number is *bank* × 32 + *line*, as in Rockchip pinout tables:
-GPIO3_A3 is 3 × 32 + 3 = 99 (bank letters A–D are lines 0–7, 8–15, 16–23, 24–31).
+if that cannot be determined, `-g` is required.
+With `-m`, the GPIO given by `-g` must be the one the PPS device uses.
+With `rk35xx`, GPIO*b*\_*Xn* is *b* × 32 + 8 × *X* + *n*, where *X* is 0–3 for A–D,
+e.g. GPIO3_A3 is 99, GPIO4_C6 is 150.
 
 `-t` *seconds*\
 Measure for the specified duration after initial synchronization.
@@ -115,7 +108,7 @@ Set the minimum interval between the starts of GPIO reads, in milliseconds.
 The default is 0.
 
 `-v`\
-Print individual observations and a final statistical summary, including median and maximum polling brackets.
+Print the configuration, individual observations and a final statistical summary, including median and maximum polling brackets.
 
 `-h`\
 Show help.
