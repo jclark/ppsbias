@@ -18,7 +18,14 @@ with the estimates produced by the program being confirmed by two independent me
 - comparing the kernel timestamps with a system clock synchronized from the Raspberry Pi 5's PTP hardware clock (PHC),
   with the PHC synchronized via PTP to a PTP grandmaster connected by a back-to-back link
 
-The program has also been confirmed to run on a Raspberry Pi 4, a Raspberry Pi 3B, a Radxa ZERO 3E (RK3566) and an ODROID-M1 (RK3568).
+The program has also been confirmed to work on:
+
+* Raspberry Pi CM5
+* Raspberry Pi CM4
+* Raspberry Pi 4
+* Raspberry Pi 3B
+* Radxa ZERO 3E (RK3566)
+* ODROID-M1 (RK3568)
 
 The systematic bias is often caused by wakeup latency on the platform I/O path.
 Polling can itself affect this by keeping the hardware awake.
