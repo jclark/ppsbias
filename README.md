@@ -134,6 +134,15 @@ If this shows that, for example, CPU0 is handling the PPS interrupts, then use `
 taskset -c 3 ppsbias -m rpi5
 ```
 
+Use the `performance` CPU frequency governor while measuring.
+`ppsbias` sleeps between pulses, so with a governor such as `ondemand` the CPU may be running slowly when the pulse arrives.
+Each GPIO read then takes longer, and the polling brackets are wider.
+To switch governor:
+
+```
+echo performance | sudo tee /sys/devices/system/cpu/cpufreq/policy*/scaling_governor
+```
+
 With the `-c` option, `ppsbias` cannot share the GPIO with the `pps-gpio` driver.
 If `-c` reports that the device is busy, first stop programs using its PPS devices, such as chrony or ntpd.
 Then unload the module.
