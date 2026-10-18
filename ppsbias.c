@@ -522,6 +522,9 @@ static void escaped(const char *s)
 
 static void difference(const char *key, double ns) { printf(" %s=%.1fe-6", key, ns / 1000); }
 
+/* Seconds, fixed point to the nanosecond, as for timestamp(). */
+static void seconds(const char *key, double ns) { printf(" %s=%.9f", key, ns / NS); }
+
 static const char *interpolate(const struct sample *left, const struct sample *odd,
 			      const struct sample *right, double *bias)
 {
@@ -541,15 +544,15 @@ static void record(const struct sample *s, const char *unavailable, bool interpo
 	if (!verbose) return;
 	if (s->event.present) timestamp("timestamp", s->event.kernel);
 	else printf("sourceStatus=%s", s->event.status);
-	if (s->polled && s->valid) difference("bias", ((double)sub(s->event.kernel, s->polled_ns) - s->polled_fraction));
-	if (s->bracket_ok) difference("bracket", (double)s->bracket);
+	if (s->polled && s->valid) seconds("bias", ((double)sub(s->event.kernel, s->polled_ns) - s->polled_fraction));
+	if (s->bracket_ok) seconds("bracket", (double)s->bracket);
 	if (s->poll_status) printf(" pollStatus=%s", s->poll_status);
 	if (s->event.present && s->event.status) printf(" sourceStatus=%s", s->event.status);
 	if (unavailable || interpolated) {
 		putchar(' '); timestamp("unpolledTimestamp", unpolled_timestamp);
 	}
 	if (unavailable) printf(" unpolledStatus=%s", unavailable);
-	if (interpolated) difference("unpolledBias", bias);
+	if (interpolated) seconds("unpolledBias", bias);
 	putchar('\n'); output_ok();
 }
 
