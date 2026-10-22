@@ -32,3 +32,17 @@ for dev in ppsrk ppsrk3; do
 	echo "$dev.-1" > sys/class/pps/$dev/name
 	ln -s ../../../../../dt/$dev sys/bus/platform/devices/$dev/of_node
 done
+# TI K3 Keystone GPIO main_gpio1 (phandle 0x31); ppsk3 is its line 18.
+# ppsk3bad is line 18 of the controller labelled gpio, which is not a Keystone GPIO.
+mkdir -p dt/bus/gpio@601000 dt/ppsk3 dt/ppsk3bad
+printf '/bus/gpio@601000\0' > dt/__symbols__/main_gpio1
+printf 'ti,am64-gpio\0ti,keystone-gpio\0' > dt/bus/gpio@601000/compatible
+{ cell 0; cell 0x601000; cell 0; cell 0x100; } > dt/bus/gpio@601000/reg
+cell 0x31 > dt/bus/gpio@601000/phandle
+{ cell 0x31; cell 18; cell 0; } > dt/ppsk3/gpios
+{ cell 7; cell 18; cell 0; } > dt/ppsk3bad/gpios
+for dev in ppsk3 ppsk3bad; do
+	mkdir -p sys/class/pps/$dev sys/bus/platform/devices/$dev
+	echo "$dev.-1" > sys/class/pps/$dev/name
+	ln -s ../../../../../dt/$dev sys/bus/platform/devices/$dev/of_node
+done

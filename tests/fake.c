@@ -41,6 +41,7 @@ static void advance(int64_t t)
 	memcpy(registers + 0x34, &value, 4);
 	memcpy(registers + 0x10008, &value, 4);
 	memcpy(registers + 0x70, &value, 4); /* rk35xx GPIO_EXT_PORT */
+	memcpy(registers + 0x20, &value, 4); /* tik3 GPIO_IN_DATA01 */
 }
 static int64_t bias_for(int64_t edge)
 {
@@ -67,7 +68,7 @@ int fake_open(const char *path, int flags, ...)
 		if (is("denied")) { errno = EACCES; return -1; }
 		return 102;
 	}
-	if (!strcmp(path, "/dev/mem")) { assert(is("fallback") || is("rk") || is("rk_v1")); return 102; }
+	if (!strcmp(path, "/dev/mem")) { assert(is("fallback") || is("rk") || is("rk_v1") || is("ti") || is("ti_pid")); return 102; }
 	if (strstr(path, "pps")) { assert((flags & O_ACCMODE) == O_RDONLY); return 103; }
 	return 100;
 }
@@ -87,9 +88,12 @@ int fake_close(int fd)
 void *fake_mmap(void *a, size_t len, int prot, int flags, int fd, off_t off)
 {
 	(void)a; assert(len <= sizeof registers && prot == PROT_READ && flags == MAP_SHARED && fd == 102);
-	assert(off == (is("fallback") ? (off_t)0x1f000d0000 : is("rk") || is("rk_v1") ? (off_t)0xfdd60000 : 0));
+	assert(off == (is("fallback") ? (off_t)0x1f000d0000 : is("rk") || is("rk_v1") ? (off_t)0xfdd60000 :
+		       is("ti") || is("ti_pid") ? (off_t)0x601000 : 0));
 	uint32_t version = is("rk_v1") ? 0 : 0x01000c2b; /* rk35xx GPIO_VERSION_ID */
 	memcpy(registers + 0x78, &version, 4);
+	uint32_t pid = is("ti_pid") ? 0x44822905 : 0x44832905; /* tik3 GPIO_PID */
+	memcpy(registers, &pid, 4);
 	return registers;
 }
 int fake_munmap(void *a, size_t len) { assert(a == registers && len > 0); return 0; }

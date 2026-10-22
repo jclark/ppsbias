@@ -33,6 +33,8 @@ int main(void)
 	assert(register_offset(&models[2], 28, &mask) == 0x14008 && mask == 1);
 	assert(register_offset(&models[2], 53, &mask) == 0x18008 && mask == (1u << 19));
 	assert(register_offset(&models[3], 99, &mask) == 0x70 && mask == (1u << 3));
+	assert(register_offset(&models[4], 11, &mask) == 0x20 && mask == (1u << 11));
+	assert(register_offset(&models[4], 72, &mask) == 0x70 && mask == (1u << 8));
 	/* rk35xx bank lookup against the synthetic device tree from fixture.sh. */
 	char root[] = "/tmp/ppsbias-unit-XXXXXX", cmd[256], dt[64], sys[64];
 	assert(mkdtemp(root));
@@ -47,8 +49,12 @@ int main(void)
 	assert(rk_bank(0, &base, &phandle) && base == UINT64_C(0xfdd60000) && phandle == 0x22);
 	assert(!rk_bank(1, &base, &phandle));
 	assert(!pps_gpio("ppsrk3", &phandle, &line, &hard) && phandle == 0x53 && line == 3);
-	assert(!model_gpio(&models[3], phandle, line, &gpio, &hard) && gpio == 99);
-	assert(model_gpio(&models[3], 7, 18, &gpio, &hard));
+	assert(!model_gpio(&models[3], phandle, line, &gpio, &base, &hard) && gpio == 99);
+	assert(model_gpio(&models[3], 7, 18, &gpio, &base, &hard));
+	assert(!pps_gpio("ppsk3", &phandle, &line, &hard) && phandle == 0x31 && line == 18);
+	assert(!model_gpio(&models[4], phandle, line, &gpio, &base, &hard) && gpio == 18 && base == 0x601000);
+	assert(!strcmp(model_gpio(&models[4], 7, 18, &gpio, &base, &hard), "PPS GPIO controller is not a TI Keystone GPIO"));
+	assert(model_gpio(&models[4], 0x99, 18, &gpio, &base, &hard));
 	snprintf(cmd, sizeof cmd, "rm -r %s", root);
 	assert(system(cmd) == 0);
 	char *output = NULL;

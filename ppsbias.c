@@ -4,6 +4,7 @@
 /* Compare physical 1 Hz rising GPIO edges with kernel timestamps. */
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -106,13 +107,15 @@ static int64_t check_clocks(void)
 }
 
 /* symbol: the device-tree __symbols__ label of the GPIO controller whose registers are read;
- * NULL for rk35xx, which has one controller per 32-line bank, found through the gpioN aliases. */
+ * NULL for rk35xx, which has one controller per 32-line bank, found through the gpioN aliases,
+ * and for tik3, whose controller is whichever TI Keystone GPIO the PPS device uses. */
 struct model { const char *name, *device, *access, *symbol; uint64_t physical; size_t span; unsigned count; };
 static const struct model models[] = {
 	{ "rpi3", "/dev/gpiomem", "bcm", "gpio", UINT64_C(0x3f200000), 0x1000, 54 },
 	{ "rpi4", "/dev/gpiomem", "bcm", "gpio", UINT64_C(0xfe200000), 0x1000, 58 },
 	{ "rpi5", "/dev/gpiomem0", "rp1", "rp1_gpio", UINT64_C(0x1f000d0000), 0x30000, 54 },
-	{ "rk35xx", "/dev/mem", "rk35xx", NULL, 0, 0x100, 320 }
+	{ "rk35xx", "/dev/mem", "rk35xx", NULL, 0, 0x100, 320 },
+	{ "tik3", "/dev/mem", "tik3", NULL, 0, 0x100, 160 }
 };
 static const char *dt_root = "/proc/device-tree", *sys_root = "/sys";
 
@@ -157,19 +160,53 @@ static bool node_phandle(const char *ref, char *node, size_t cap, uint32_t *phan
 	return true;
 }
 
-/* Base address and phandle of the Rockchip controller for a bank, via its gpioN alias. */
-static bool rk_bank(unsigned bank, uint64_t *base, uint32_t *phandle)
+/* Base address from the reg property of a device-tree node with a single register range. */
+static bool node_base(const char *node, uint64_t *base)
 {
-	char ref[PATH_MAX], node[PATH_MAX], path[PATH_MAX], cells[16];
-	if (!format(ref, sizeof ref, "%s/aliases/gpio%u", dt_root, bank) ||
-	    !node_phandle(ref, node, sizeof node, phandle) ||
-	    !format(path, sizeof path, "%s%s/reg", dt_root, node))
-		return false;
+	char path[PATH_MAX], cells[16];
+	if (!format(path, sizeof path, "%s%s/reg", dt_root, node)) return false;
 	long n = read_file(path, cells, sizeof cells);
 	if (n == 16) *base = (uint64_t)be32(cells) << 32 | be32(cells + 4);
 	else if (n == 8) *base = be32(cells);
 	else return false;
 	return true;
+}
+
+/* Base address and phandle of the Rockchip controller for a bank, via its gpioN alias. */
+static bool rk_bank(unsigned bank, uint64_t *base, uint32_t *phandle)
+{
+	char ref[PATH_MAX], node[PATH_MAX];
+	return format(ref, sizeof ref, "%s/aliases/gpio%u", dt_root, bank) &&
+	       node_phandle(ref, node, sizeof node, phandle) && node_base(node, base);
+}
+
+/* Base address of the TI Keystone GPIO controller with a phandle, found among the labelled nodes. */
+static const char *ti_controller(uint32_t phandle, uint64_t *base)
+{
+	char dir[PATH_MAX], ref[PATH_MAX], node[PATH_MAX], path[PATH_MAX], compatible[256];
+	DIR *d = format(dir, sizeof dir, "%s/__symbols__", dt_root) ? opendir(dir) : NULL;
+	if (!d) return "cannot read the device-tree __symbols__";
+	bool found = false;
+	struct dirent *e;
+	while (!found && (e = readdir(d))) {
+		uint32_t p;
+		found = e->d_name[0] != '.' && format(ref, sizeof ref, "%s/%s", dir, e->d_name) &&
+			node_phandle(ref, node, sizeof node, &p) && p == phandle;
+	}
+	closedir(d);
+	if (!found) return "cannot find the PPS GPIO controller among the labelled device-tree nodes";
+	long n = format(path, sizeof path, "%s%s/compatible", dt_root, node) ?
+		read_file(path, compatible, sizeof compatible) : -1;
+	static const char want[] = "ti,keystone-gpio";
+	bool keystone = false;
+	for (long i = 0; i < n; ) { /* compatible is a list of NUL-terminated strings */
+		size_t len = strnlen(compatible + i, (size_t)(n - i));
+		if (len == sizeof want - 1 && !memcmp(compatible + i, want, len)) keystone = true;
+		i += (long)len + 1;
+	}
+	if (!keystone) return "PPS GPIO controller is not a TI Keystone GPIO";
+	if (!node_base(node, base)) return "cannot read the PPS GPIO controller address";
+	return NULL;
 }
 
 /* The GPIO specifier of a pps-gpio device: ppsN name -> platform device -> gpios property.
@@ -195,11 +232,20 @@ static const char *pps_gpio(const char *pps, uint32_t *phandle, uint32_t *line, 
 	return NULL;
 }
 
-/* Map a GPIO specifier to this model's -g numbering. */
-static const char *model_gpio(const struct model *m, uint32_t phandle, uint32_t line, uint64_t *gpio, bool *hard)
+/* Map a GPIO specifier to this model's -g numbering; tik3 also sets the controller's *base. */
+static const char *model_gpio(const struct model *m, uint32_t phandle, uint32_t line, uint64_t *gpio,
+			      uint64_t *base, bool *hard)
 {
 	char ref[PATH_MAX], node[PATH_MAX];
 	uint32_t controller;
+	if (!strcmp(m->access, "tik3")) {
+		*hard = true;
+		const char *why = ti_controller(phandle, base);
+		if (why) return why;
+		if (line >= m->count) return "PPS GPIO is outside the controller range";
+		*gpio = line;
+		return NULL;
+	}
 	if (!m->symbol) {
 		for (unsigned bank = 0; bank < m->count / 32; bank++) {
 			uint64_t base;
@@ -239,6 +285,7 @@ static size_t register_offset(const struct model *m, unsigned gpio, uint32_t *ma
 	unsigned bit = gpio % 32;
 	size_t off = 0x34 + 4 * (gpio / 32);
 	if (!strcmp(m->access, "rk35xx")) off = 0x70; /* GPIO_EXT_PORT of the bank's controller */
+	else if (!strcmp(m->access, "tik3")) off = 0x20 + 0x28 * (gpio / 32); /* GPIO_IN_DATAnn */
 	else if (!strcmp(m->access, "rp1")) {
 		unsigned bank = gpio < 28 ? 0 : gpio < 34 ? 1 : 2;
 		bit = gpio - (bank == 0 ? 0 : bank == 1 ? 28 : 34);
@@ -248,19 +295,21 @@ static size_t register_offset(const struct model *m, unsigned gpio, uint32_t *ma
 	return off;
 }
 
-static void map_registers(struct source *s, const struct model *m, unsigned gpio)
+/* base: the controller address for tik3, from model_gpio. */
+static void map_registers(struct source *s, const struct model *m, unsigned gpio, uint64_t base)
 {
 	uint64_t physical = 0;
 	long page = sysconf(_SC_PAGESIZE);
 	if (page <= 0) { fail("cannot determine page size"); return; }
-	bool rk = !strcmp(m->access, "rk35xx");
+	bool rk = !strcmp(m->access, "rk35xx"), ti = !strcmp(m->access, "tik3");
 	if (rk) {
 		uint32_t phandle;
 		if (!rk_bank(gpio / 32, &physical, &phandle)) { fail("no device-tree gpioN alias for the GPIO's bank"); return; }
 	}
+	if (ti) physical = base;
 	s->device = m->device;
 	int fd = open(s->device, O_RDONLY | O_SYNC | O_CLOEXEC);
-	if (fd < 0 && errno == ENOENT && !rk) {
+	if (fd < 0 && errno == ENOENT && m->physical) {
 		s->device = "/dev/mem"; physical = m->physical;
 		fd = open(s->device, O_RDONLY | O_SYNC | O_CLOEXEC);
 	}
@@ -278,6 +327,14 @@ static void map_registers(struct source *s, const struct model *m, unsigned gpio
 		uint32_t version = *(volatile uint32_t *)((char *)s->mapping + displacement + 0x78);
 		if (version != UINT32_C(0x01000c2b) && version != UINT32_C(0x0101157c) && version != UINT32_C(0x010219c8)) {
 			fprintf(stderr, "unsupported Rockchip GPIO controller version 0x%08" PRIx32 "\n", version);
+			fatal = true;
+		}
+	}
+	if (s->mapping && ti) {
+		/* GPIO_PID FUNC is 0x483 for the DaVinci/Keystone GPIO whose layout register_offset assumes. */
+		uint32_t pid = *(volatile uint32_t *)((char *)s->mapping + displacement);
+		if ((pid >> 16 & 0xfff) != 0x483) {
+			fprintf(stderr, "unsupported TI GPIO controller PID 0x%08" PRIx32 "\n", pid);
 			fatal = true;
 		}
 	}
@@ -615,9 +672,10 @@ static int usage(int status)
 {
 	FILE *f = status ? stderr : stdout;
 	fprintf(f, "usage: ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
-		"       ppsbias -m rpi3|rpi4|rpi5|rk35xx [-p ppsdev] [-g gpio] [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
+		"       ppsbias -m rpi3|rpi4|rpi5|rk35xx|tik3 [-p ppsdev] [-g gpio] [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
 		"  -c chip       GPIO v2 realtime rising events and values; requires -g; no -m/-p\n"
-		"  -m model      Read-only BCM (rpi3/rpi4), RP1 (rpi5) or Rockchip GPIO v2 (rk35xx) registers\n"
+		"  -m model      Read-only BCM (rpi3/rpi4), RP1 (rpi5), Rockchip GPIO v2 (rk35xx)\n"
+		"                or TI K3 Keystone GPIO (tik3) registers\n"
 		"  -p ppsdev     pps-gpio device for assert timestamps; default /dev/pps0; with -m only\n"
 		"  -g gpio       Controller GPIO number (not header pin); with -m the default is\n"
 		"                the PPS device's GPIO from the device tree\n"
@@ -712,13 +770,18 @@ int main(int argc, char **argv)
 	}
 	if (model && !pps) pps = "/dev/pps0";
 	const char *gpio_source = model ? "option" : NULL;
-	if (model && !gpio_given) {
+	/* tik3 finds its controller only through the device tree, so -g cannot replace it. */
+	bool ti = model && !strcmp(model->access, "tik3");
+	uint64_t base = 0;
+	if (model && (!gpio_given || ti)) {
 		uint32_t phandle = 0, line = 0;
-		bool hard = false;
+		uint64_t found = 0;
+		bool hard = ti;
 		const char *why = pps_gpio(pps, &phandle, &line, &hard);
-		if (!why) why = model_gpio(model, phandle, line, &gpio, &hard);
+		if (!why) why = model_gpio(model, phandle, line, &found, &base, &hard);
+		if (!why && gpio_given && found != gpio) why = "-g is not the PPS device's GPIO";
 		if (why) { fprintf(stderr, "%s: %s%s\n", pps, why, hard ? "" : "; use -g"); return 1; }
-		gpio_source = "devicetree";
+		if (!gpio_given) { gpio = found; gpio_source = "devicetree"; }
 	}
 	struct sigaction action = { .sa_handler = on_stop, .sa_flags = SA_RESTART }, ignore = { .sa_handler = SIG_IGN };
 	if (sigemptyset(&action.sa_mask) < 0 || sigemptyset(&ignore.sa_mask) < 0 ||
@@ -729,7 +792,7 @@ int main(int argc, char **argv)
 	double *values = calloc(cap, sizeof *values), *brackets = calloc(cap, sizeof *brackets);
 	if (!values || !brackets) syserror("calloc");
 	if (!fatal) {
-		if (model) { map_registers(&src, model, (unsigned)gpio); if (!fatal) open_pps(&src, pps); }
+		if (model) { map_registers(&src, model, (unsigned)gpio, base); if (!fatal) open_pps(&src, pps); }
 		else request_line(&src, chip, (unsigned)gpio);
 	}
 	if (!fatal) configuration(&src, model, pps, (unsigned)gpio, gpio_source, alternate, half, spacing);

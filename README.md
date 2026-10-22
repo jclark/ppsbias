@@ -26,6 +26,7 @@ The program has also been confirmed to work on:
 * Raspberry Pi 3B
 * Radxa ZERO 3E (RK3566)
 * ODROID-M1 (RK3568)
+* BeagleY-AI (TI AM67A)
 
 The systematic bias is often caused by wakeup latency on the platform I/O path.
 Polling can itself affect this by keeping the hardware awake.
@@ -58,7 +59,7 @@ Normal usage is to specify the `-m` option with the model of computer being used
 ppsbias -m rpi5
 ```
 
-The other values allowed for `-m` are `rpi4`, `rpi3` and `rk35xx`.
+The other values allowed for `-m` are `rpi4`, `rpi3`, `rk35xx` and `tik3`.
 It will perform the estimate for 10 seconds.
 The `-v` verbose option will show more information. `-t 60` will run for 60 seconds.
 
@@ -71,12 +72,14 @@ ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w ms] [-s ms]
 
 Either `-m` or `-c` must be specified.
 `-m` is preferred: it reads GPIO registers while the PPS driver supplies timestamps.
-It is specific to Raspberry Pi and Rockchip RK35xx hardware.
+It is specific to Raspberry Pi, Rockchip RK35xx and TI K3 hardware.
 `-c` is the portable backup, using GPIO ioctl reads and GPIO-event timestamps.
 The events take a similar interrupt path to PPS, giving an order-of-magnitude estimate; `-m` measures the actual PPS timestamps and usually gives tighter polling brackets.
 
 `-m` *model*\
-Read GPIO registers for `rpi3`, `rpi4`, `rpi5` or `rk35xx`.
+Read GPIO registers for `rpi3`, `rpi4`, `rpi5`, `rk35xx` or `tik3`.
+`tik3` is for TI K3 SoCs (such as the AM67A on the BeagleY-AI),
+whose GPIO controllers are TI Keystone GPIOs (device-tree compatible `ti,keystone-gpio`).
 
 `-p` *ppsdev*\
 Read PPS assert timestamps from *ppsdev*.
@@ -96,6 +99,8 @@ if that cannot be determined, `-g` is required.
 With `-m`, the GPIO given by `-g` must be the one the PPS device uses.
 With `rk35xx`, GPIO*b*\_*Xn* is *b* × 32 + 8 × *X* + *n*, where *X* is 0–3 for A–D,
 e.g. GPIO3_A3 is 99, GPIO4_C6 is 150.
+With `tik3`, the GPIO controller can only be found from the device tree, so `-g` cannot replace it;
+*gpio* is the line within that controller, e.g. 11 for GPIO1_11.
 
 `-t` *seconds*\
 Measure for the specified duration after initial synchronization.

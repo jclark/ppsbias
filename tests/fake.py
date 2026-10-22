@@ -54,6 +54,22 @@ r = run([fake, '-m', 'rk35xx', '-p', 'fakepps', '-t', '4'], 1, 'rk')
 assert 'gpioN' in r.stderr, r
 r = run([fake, '-m', 'rk35xx', '-p', 'nosuchpps', '-t', '4'], 1, 'rk')
 assert 'use -g' in r.stderr, r
+# tik3: the controller is whichever Keystone GPIO the PPS device uses, read through /dev/mem.
+r = run([fake, '-m', 'tik3', '-p', 'ppsk3', '-t', '4', '-v'], 0, 'ti')
+first = rows(r)[0]
+assert first['access'] == 'tik3' and first['device'] == '/dev/mem', first
+assert first['gpio'] == '18' and first['gpioSource'] == 'devicetree', first
+assert 'median' in summary(r) and not r.stderr, r
+first = rows(run([fake, '-m', 'tik3', '-p', 'ppsk3', '-g', '18', '-t', '4', '-v'], 0, 'ti'))[0]
+assert first['gpioSource'] == 'option', first
+r = run([fake, '-m', 'tik3', '-p', 'ppsk3', '-g', '11', '-t', '4'], 1, 'ti')
+assert "-g is not the PPS device's GPIO" in r.stderr and 'use -g' not in r.stderr, r
+r = run([fake, '-m', 'tik3', '-p', 'ppsk3', '-t', '4'], 1, 'ti_pid')
+assert 'unsupported TI GPIO controller PID' in r.stderr, r
+r = run([fake, '-m', 'tik3', '-p', 'ppsk3bad', '-t', '4'], 1, 'ti')
+assert 'not a TI Keystone GPIO' in r.stderr, r
+r = run([fake, '-m', 'tik3', '-p', 'nosuchpps', '-g', '18', '-t', '4'], 1, 'ti')
+assert 'PPS device name' in r.stderr and 'use -g' not in r.stderr, r
 r = run([fake, '-m', 'rpi5', '-p', 'ppslow', '-t', '1'], 1)
 assert 'active low' in r.stderr and not r.stdout, r
 with tempfile.TemporaryDirectory() as empty:
