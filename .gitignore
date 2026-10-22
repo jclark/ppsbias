@@ -3,6 +3,7 @@
 /tests/unit
 /tests/fake
 /tests/clocks
+/tmp/
 *.o
 __pycache__/
 
