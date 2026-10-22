@@ -4,6 +4,7 @@ This repository contains tools to help estimate the systematic bias in kernel PP
 By bias I mean the delay between the occurrence of the pulse and the time reported by the kernel through a `/dev/ppsN` device.
 This bias will translate into inaccuracy in a stratum 1 NTP server using the PPS device as a reference clock.
 On modern Raspberry Pis, this bias is typically of the order of 10 µs.
+The bias is often dramatically affected by power management, such as the CPU frequency governor.
 Note that the NTP daemon has no means to detect this inaccuracy and will not be able to report it.
 However, NTP daemons can be configured to correct for the bias.
 My [blog post](https://satpulse.net/2026/09/06/measuring-systematic-pps-bias-on-the-raspberry-pi-5.html) has more background.
