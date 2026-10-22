@@ -10,23 +10,29 @@ My [blog post](https://satpulse.net/2026/09/06/measuring-systematic-pps-bias-on-
 
 The main program is `ppsbias` which estimates the bias by comparing the kernel PPS timestamps with the time of the pulse estimated by polling the GPIO.
 
-The program has been tested most extensively on a Raspberry Pi 5,
-with the estimates produced by the program being confirmed by two independent methods:
+The program has been tested on the following machines:
 
-- using the PPS echo feature, together with an external time interval counter,
-  and bpftrace to estimate the post timestamp part of the measured interval
-- comparing the kernel timestamps with a system clock synchronized from the Raspberry Pi 5's PTP hardware clock (PHC),
-  with the PHC synchronized via PTP to a PTP grandmaster connected by a back-to-back link
-
-The program has also been confirmed to work on:
-
+* Raspberry Pi 5
 * Raspberry Pi CM5
-* Raspberry Pi CM4
 * Raspberry Pi 4
+* Raspberry Pi CM4
 * Raspberry Pi 3B
 * Radxa ZERO 3E (RK3566)
 * ODROID-M1 (RK3568)
 * BeagleY-AI (TI AM67A)
+
+On machines that support PTP, it is possible to make an independent estimate of the bias by comparing the kernel timestamps with a system clock synchronized with a PTP hardware clock (PHC),
+with the PHC synchronized via PTP to a PTP grandmaster connected by a back-to-back link or via a PTP-aware switch.
+I have done this on the Raspberry Pi 5, ODROID-M1 and BeagleY-AI, and the results were consistent.
+On ARM SBCs with PTP, the ingress and egress latencies are typically uncalibrated,
+as shown by the measured path delay exceeding the cable delay,
+so the accuracy of the PTP estimate is limited by the difference between the path delay and the cable delay.
+It is also limited by the accuracy of the synchronization of the PHC and the system clock.
+
+On the Raspberry Pi 5, I also made another independent estimate by using the PPS echo feature,
+together with an external time interval counter,
+and bpftrace to estimate the post-timestamp part of the measured interval.
+Again the results were consistent.
 
 The systematic bias is often caused by wakeup latency on the platform I/O path.
 Polling can itself affect this by keeping the hardware awake.
@@ -72,14 +78,12 @@ ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w ms] [-s ms]
 
 Either `-m` or `-c` must be specified.
 `-m` is preferred: it reads GPIO registers while the PPS driver supplies timestamps.
-It is specific to Raspberry Pi, Rockchip RK35xx and TI K3 hardware.
+It is specific to Raspberry Pi, Rockchip RK35xx and TI K3 (e.g. AM67A on the BeagleY-AI) hardware.
 `-c` is the portable backup, using GPIO ioctl reads and GPIO-event timestamps.
-The events take a similar interrupt path to PPS, giving an order-of-magnitude estimate; `-m` measures the actual PPS timestamps and usually gives tighter polling brackets.
+The events take a similar interrupt path to PPS, giving an order-of-magnitude estimate; `-m` measures the actual PPS timestamps and usually gives much tighter polling brackets.
 
 `-m` *model*\
 Read GPIO registers for `rpi3`, `rpi4`, `rpi5`, `rk35xx` or `tik3`.
-`tik3` is for TI K3 SoCs (such as the AM67A on the BeagleY-AI),
-whose GPIO controllers are TI Keystone GPIOs (device-tree compatible `ti,keystone-gpio`).
 
 `-p` *ppsdev*\
 Read PPS assert timestamps from *ppsdev*.
