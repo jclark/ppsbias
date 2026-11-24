@@ -73,24 +73,30 @@ The `-v` verbose option will show more information. `-t 60` will run for 60 seco
 The full command line syntax is as follows.
 
 ```text
-ppsbias [-p ppsdev] [-t seconds] [-e] [-v] [-w ms] [-s ms]
-ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w ms] [-s ms]
+ppsbias [-p ppsdev] [-c chip] [-g gpio] [-t seconds] [-e] [-v] [-w ms] [-s ms]
 ```
 
-The first form is preferred: it reads the level of the PPS device's GPIO from the GPIO controller's registers while the PPS driver supplies timestamps.
-It finds the GPIO and its controller from the device tree.
-It supports the GPIO controllers of the Raspberry Pi 3, 4 and 5, Rockchip SoCs with GPIO v2 (such as the RK3566, RK3568 and RK3588), TI K3 SoCs (such as the AM67A on the BeagleY-AI) and NXP i.MX SoCs (such as the i.MX 8M Plus).
-On the Raspberry Pi the registers are read through `/dev/gpiomem` or `/dev/gpiomem0`, which the Raspberry Pi kernel provides,
-or through `/dev/mem` if those are missing, as with a mainline kernel;
-on the others they are read through `/dev/mem`, which needs a suitable kernel configuration (see below).
-`-c` is the portable backup, using GPIO ioctl reads and GPIO-event timestamps.
-The events take a similar interrupt path to PPS, giving an order-of-magnitude estimate; the first form measures the actual PPS timestamps and usually gives much tighter polling brackets.
+`ppsbias` can use one of two methods to poll the GPIO.
+
+The first method reads the GPIO registers directly.
+This gives the most accurate measurements but requires a supported GPIO controller
+(`ppsbias` can determine this itself).
+To use this method, do not specify `-c` or `-g`;
+specify `-p` only in the unlikely event that you have more than one GPIO PPS device.
+The GPIO controllers of most ARM SBCs are supported,
+including those from Raspberry Pi and those using Rockchip, TI K3 and NXP i.MX SoCs.
+As well as a supported GPIO controller, the kernel must meet some requirements.
+Raspberry Pi kernels have a gpiomem device which is sufficient by itself.
+In other cases, `ppsbias` has to use `/dev/mem`: this requires a kernel configured with `CONFIG_DEVMEM`.
+If the kernel is configured with `CONFIG_IO_STRICT_DEVMEM`, then the kernel must be booted with the parameter `iomem=relaxed`;
+Armbian kernels do not require this parameter, but Fedora and Debian kernels do.
+
+The second method is more portable but much less accurate.
+To use this, specify `-c` and `-g` and do not specify `-p`.
 
 `-p` *ppsdev*\
-Read PPS assert timestamps from *ppsdev*, which must be a GPIO PPS device whose GPIO is given by the device tree.
-The default is the only such device;
-if there is more than one, `-p` is required.
-Cannot be combined with `-c`.
+Read PPS timestamps from *ppsdev* (e.g. `/dev/pps0`), which must be a GPIO PPS device.
+This is needed only if there is more than one GPIO PPS device.
 
 `-c` *chip*\
 Read values and realtime rising-edge events from a GPIO v2 character device.
@@ -122,28 +128,6 @@ Print the configuration, individual observations and a final statistical summary
 
 `-h`\
 Show help.
-
-### Reading registers through /dev/mem
-
-Without a gpiomem device, `ppsbias` maps the page holding the GPIO controller's level register read-only from `/dev/mem`.
-That is always so on Rockchip, TI K3 and i.MX, and on a Raspberry Pi running a mainline kernel.
-This needs:
-
-* root, or more precisely `CAP_SYS_RAWIO`, to open `/dev/mem`;
-* a kernel with `CONFIG_DEVMEM`, which is not in kernel lockdown (as it may be under UEFI Secure Boot);
-* a kernel that allows `/dev/mem` to map registers a driver is using.
-  The GPIO controller is always in use by its driver, so a kernel built with `CONFIG_IO_STRICT_DEVMEM` refuses the mapping with "Operation not permitted",
-  unless it is booted with the kernel parameter `iomem=relaxed`.
-  `CONFIG_STRICT_DEVMEM` without `CONFIG_IO_STRICT_DEVMEM` is fine: it restricts `/dev/mem` to non-RAM ranges.
-
-To check the configuration of the running kernel:
-
-```
-grep STRICT_DEVMEM /boot/config-$(uname -r)
-```
-
-For example, the kernels of Raspberry Pi OS, the BeagleBoard.org Debian images and Armbian's `current-rockchip64` allow the mapping;
-Fedora's kernel (Fedora 45) has `CONFIG_IO_STRICT_DEVMEM` and needs `iomem=relaxed`.
 
 For accurate results, `ppsbias` needs to run on a different CPU from the one handling the PPS interrupt.
 Use
@@ -202,7 +186,6 @@ With classic ntpd:
 server 127.127.22.0
 fudge 127.127.22.0 time1 12.7e-6
 ```
-
 
 ## ppsecho usage
 
