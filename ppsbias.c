@@ -838,12 +838,11 @@ static bool number(const char *p, uint64_t scale, uint64_t min, uint64_t max, ui
 static int usage(int status)
 {
 	FILE *f = status ? stderr : stdout;
-	fprintf(f, "usage: ppsbias [-p ppsdev] [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
-		"       ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
-		"  -p ppsdev     pps-gpio device for assert timestamps; its GPIO's level is read from\n"
-		"                the controller's registers; default: the only pps-gpio device\n"
-		"  -c chip       GPIO v2 realtime rising events and values instead; requires -g; no -p\n"
-		"  -g gpio       Line on chip (not header pin); with -c only\n"
+	fprintf(f, "usage: ppsbias [-p ppsdev] [-c chip] [-g gpio] [-t seconds] [-e] [-v] [-w window_ms] [-s spacing_ms]\n"
+		"  -p ppsdev     GPIO PPS device; needed only if there is more than one\n"
+		"  -c chip       Poll a GPIO v2 character device instead of the GPIO registers:\n"
+		"                more portable, much less accurate; requires -g; no -p\n"
+		"  -g gpio       Line on chip (not header pin); requires -c\n"
 		"  -t seconds    Integer duration after fresh synchronization, 1..86400 (default 10)\n"
 		"  -w window_ms  Polling half-window, 0.000001..499.999 ms (default 1)\n"
 		"  -s spacing_ms Minimum read-start spacing, 0..499.999 ms (default 0)\n"
