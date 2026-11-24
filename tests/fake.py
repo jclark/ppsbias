@@ -69,7 +69,8 @@ for pps, family, device, controller, address in [
         ('ppsbcm', 'bcm2835', '/dev/gpiomem', '/soc/gpio@7e200000', None),
         ('pps2711', 'bcm2835', '/dev/gpiomem', '/soc4/gpio@7e200000', None),
         ('ppsrk', 'rockchip', '/dev/mem', '/pinctrl/gpio@fdd60000', '0xfdd60000'),
-        ('ppsk3', 'k3', '/dev/mem', '/bus@f0000/gpio@601000', '0x601000')]:
+        ('ppsk3', 'k3', '/dev/mem', '/bus@f0000/gpio@601000', '0x601000'),
+        ('ppsmxc', 'mxc', '/dev/mem', '/soc@0/bus@30000000/gpio@30200000', '0x30200000')]:
     r = run([fake, '-p', pps, '-t', '4', '-v'])
     first = rows(r)[0]
     assert first['access'] == family and first['device'] == device, first

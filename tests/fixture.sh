@@ -8,12 +8,14 @@
 #   0x22: rockchip /pinctrl/gpio@fdd60000, empty ranges, 0xfdd60000
 #   0x53: rockchip /pinctrl/gpio@fe760000, 0xfe760000
 #   0x31: k3 /bus@f0000/gpio@601000, ti,ngpio 73, 0x601000
+#   0x36: mxc /soc@0/bus@30000000/gpio@30200000, i.MX 8M Plus bus ranges, 0x30200000
 #   0x40: unsupported brcm,brcmstb-gpio
 #   0x41: rockchip under a bus with no ranges, so untranslatable
 # PPS devices (/sys/class/pps entries) with a device-tree GPIO (phandle, line, flags):
 #   pps0, pps1, fakepps: 9 18 0 (one platform device); ppslow: 9 18 1 (active low)
 #   ppsbcm: 7 18; ppsbcm54: 7 54; pps2711: 8 18; ppsrk: 0x22 18; ppsrk3: 0x53 3;
-#   ppsrk32: 0x22 32; ppsk3: 0x31 18; ppsk3big: 0x31 73; ppsbad: 0x40 18;
+#   ppsrk32: 0x22 32; ppsk3: 0x31 18; ppsk3big: 0x31 73; ppsmxc: 0x36 18;
+#   ppsbad: 0x40 18;
 #   ppsnone: 0x99 18; ppsnoranges: 0x41 18
 # and without one: ptp, a PTP clock's PPS device.
 set -e
@@ -56,6 +58,11 @@ bus /bus@f0000 2 2
 cell 0 0x600000 0 0x600000 0 0x1100 > dt/bus@f0000/ranges
 controller /bus@f0000/gpio@601000 0x31 'ti,am64-gpio\0ti,keystone-gpio' 0 0x601000 0 0x100
 cell 73 > dt/bus@f0000/gpio@601000/ti,ngpio
+bus /soc@0 1 1
+cell 0 0 0 0x3e000000 > dt/soc@0/ranges
+bus /soc@0/bus@30000000 1 1
+: > dt/soc@0/bus@30000000/ranges
+controller /soc@0/bus@30000000/gpio@30200000 0x36 'fsl,imx8mp-gpio\0fsl,imx35-gpio' 0x30200000 0x10000
 controller /soc5/gpio@7d508500 0x40 brcm,brcmstb-gpio 0 0x7d508500 0 0x40
 bus /noranges 1 1
 controller /noranges/gpio@1000 0x41 rockchip,gpio-bank 0x1000 0x100
@@ -83,6 +90,7 @@ pps ppsrk3 ppsrk3 0x53 3 0
 pps ppsrk32 ppsrk32 0x22 32 0
 pps ppsk3 ppsk3 0x31 18 0
 pps ppsk3big ppsk3big 0x31 73 0
+pps ppsmxc ppsmxc 0x36 18 0
 pps ppsbad ppsbad 0x40 18 0
 pps ppsnone ppsnone 0x99 18 0
 pps ppsnoranges ppsnoranges 0x41 18 0

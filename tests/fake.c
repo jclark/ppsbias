@@ -43,6 +43,7 @@ static void advance(int64_t t)
 	memcpy(registers + 0x10008, &value, 4);
 	memcpy(registers + 0x70, &value, 4); /* Rockchip GPIO_EXT_PORT */
 	memcpy(registers + 0x20, &value, 4); /* TI Keystone GPIO_IN_DATA01 */
+	memcpy(registers + 0x08, &value, 4); /* i.MX GPIO_PSR */
 }
 static int64_t bias_for(int64_t edge)
 {

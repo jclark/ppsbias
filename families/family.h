@@ -34,5 +34,5 @@ struct family {
 	size_t extent;
 };
 
-extern const struct family bcm2835, rp1, rockchip, k3;
+extern const struct family bcm2835, rp1, rockchip, k3, mxc;
 #endif

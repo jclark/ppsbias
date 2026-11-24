@@ -21,6 +21,7 @@ The program has been tested on the following machines:
 * Radxa ZERO 3E (RK3566)
 * ODROID-M1 (RK3568)
 * BeagleY-AI (TI AM67A)
+* NXP FRDM-IMX8MPLUS (i.MX 8M Plus)
 
 On machines that support PTP, it is possible to make an independent estimate of the bias by comparing the kernel timestamps with a system clock synchronized with a PTP hardware clock (PHC),
 with the PHC synchronized via PTP to a PTP grandmaster connected by a back-to-back link or via a PTP-aware switch.
@@ -78,7 +79,7 @@ ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w ms] [-s ms]
 
 The first form is preferred: it reads the level of the PPS device's GPIO from the GPIO controller's registers while the PPS driver supplies timestamps.
 It finds the GPIO and its controller from the device tree.
-It supports the GPIO controllers of the Raspberry Pi 3, 4 and 5, Rockchip SoCs with GPIO v2 (such as the RK3566, RK3568 and RK3588) and TI K3 SoCs (such as the AM67A on the BeagleY-AI).
+It supports the GPIO controllers of the Raspberry Pi 3, 4 and 5, Rockchip SoCs with GPIO v2 (such as the RK3566, RK3568 and RK3588) TI K3 SoCs (such as the AM67A on the BeagleY-AI) and NXP i.MX SoCs (such as the i.MX 8M Plus).
 On the Raspberry Pi the registers are read through `/dev/gpiomem` or `/dev/gpiomem0`, or `/dev/mem` if those are missing;
 on the others they are read through `/dev/mem`.
 `-c` is the portable backup, using GPIO ioctl reads and GPIO-event timestamps.

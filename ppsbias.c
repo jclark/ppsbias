@@ -108,7 +108,7 @@ static int64_t check_clocks(void)
 }
 
 /* The supported GPIO controller families, each described in its own file under families/. */
-static const struct family *const families[] = { &bcm2835, &rp1, &rockchip, &k3 };
+static const struct family *const families[] = { &bcm2835, &rp1, &rockchip, &k3, &mxc };
 
 /* The GPIO a pps-gpio device uses. */
 struct controller {

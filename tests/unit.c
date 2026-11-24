@@ -36,6 +36,7 @@ int main(void)
 	assert(rockchip.level(24, &mask) == 0x70 && mask == (1u << 24));
 	assert(k3.level(11, &mask) == 0x20 && mask == (1u << 11));
 	assert(k3.level(72, &mask) == 0x70 && mask == (1u << 8));
+	assert(mxc.level(1, &mask) == 0x08 && mask == (1u << 1));
 	uint32_t regs[0x20] = {0};
 	regs[0x78 / 4] = 0x01000c2b;
 	assert(!rockchip.check((volatile char *)regs));
@@ -57,6 +58,7 @@ int main(void)
 		{ "pps2711", &bcm2835, "/soc4/gpio@7e200000", 18, 0xfe200000, 0xb4 },
 		{ "ppsrk3", &rockchip, "/pinctrl/gpio@fe760000", 3, 0xfe760000, 0x100 },
 		{ "ppsk3", &k3, "/bus@f0000/gpio@601000", 18, 0x601000, 0x100 },
+		{ "ppsmxc", &mxc, "/soc@0/bus@30000000/gpio@30200000", 18, 0x30200000, 0x10000 },
 	};
 	for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
 		struct controller ctl;
