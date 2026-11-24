@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 
@@ -28,57 +29,73 @@ def summary(result):
     assert next(iter(r[-1])) == 'median', result
     return r[-1]
 
-for model in ('rpi3', 'rpi4', 'rpi5'):
-    args = [fake, '-m', model, '-t', '4', '-v']
-    default = run(args)
-    assert rows(default)[0]['pps'] == '/dev/pps0'
-    assert default.stdout == run([*args, '-p', '/dev/pps0']).stdout
-    override = run([*args, '-p', '/dev/pps1'])
-    assert rows(override)[0]['pps'] == '/dev/pps1'
-    assert summary(default) == summary(override)
-# The GPIO comes from the PPS device's device tree unless -g is given.
-for model in ('rpi3', 'rpi4', 'rpi5'):
-    first = rows(run([fake, '-m', model, '-t', '4', '-v']))[0]
-    assert first['gpio'] == '18' and first['gpioSource'] == 'devicetree', first
-    first = rows(run([fake, '-m', model, '-t', '4', '-v', '-g', '18']))[0]
-    assert first['gpioSource'] == 'option', first
-# rk35xx: bank controllers from the gpioN aliases, read through /dev/mem.
-r = run([fake, '-m', 'rk35xx', '-p', 'ppsrk', '-t', '4', '-v'], 0, 'rk')
-first = rows(r)[0]
-assert first['access'] == 'rk35xx' and first['device'] == '/dev/mem', first
-assert first['gpio'] == '18' and first['gpioSource'] == 'devicetree', first
-assert 'median' in summary(r) and not r.stderr, r
-r = run([fake, '-m', 'rk35xx', '-p', 'ppsrk', '-t', '4'], 1, 'rk_v1')
-assert 'unsupported Rockchip GPIO controller version' in r.stderr, r
-r = run([fake, '-m', 'rk35xx', '-p', 'fakepps', '-t', '4'], 1, 'rk')
-assert 'gpioN' in r.stderr, r
-r = run([fake, '-m', 'rk35xx', '-p', 'nosuchpps', '-t', '4'], 1, 'rk')
-assert 'use -g' in r.stderr, r
-# tik3: the controller is whichever Keystone GPIO the PPS device uses, read through /dev/mem.
-r = run([fake, '-m', 'tik3', '-p', 'ppsk3', '-t', '4', '-v'], 0, 'ti')
-first = rows(r)[0]
-assert first['access'] == 'tik3' and first['device'] == '/dev/mem', first
-assert first['gpio'] == '18' and first['gpioSource'] == 'devicetree', first
-assert 'median' in summary(r) and not r.stderr, r
-first = rows(run([fake, '-m', 'tik3', '-p', 'ppsk3', '-g', '18', '-t', '4', '-v'], 0, 'ti'))[0]
-assert first['gpioSource'] == 'option', first
-r = run([fake, '-m', 'tik3', '-p', 'ppsk3', '-g', '11', '-t', '4'], 1, 'ti')
-assert "-g is not the PPS device's GPIO" in r.stderr and 'use -g' not in r.stderr, r
-r = run([fake, '-m', 'tik3', '-p', 'ppsk3', '-t', '4'], 1, 'ti_pid')
-assert 'unsupported TI GPIO controller PID' in r.stderr, r
-r = run([fake, '-m', 'tik3', '-p', 'ppsk3bad', '-t', '4'], 1, 'ti')
-assert 'not a TI Keystone GPIO' in r.stderr, r
-r = run([fake, '-m', 'tik3', '-p', 'nosuchpps', '-g', '18', '-t', '4'], 1, 'ti')
-assert 'PPS device name' in r.stderr and 'use -g' not in r.stderr, r
-r = run([fake, '-m', 'rpi5', '-p', 'ppslow', '-t', '1'], 1)
-assert 'active low' in r.stderr and not r.stdout, r
+def fixture_with(*keep):
+    """A fixture whose only /sys/class/pps entries are those named."""
+    d = tempfile.TemporaryDirectory()
+    subprocess.run([str(Path(__file__).resolve().parent / 'fixture.sh'), d.name], check=True)
+    for entry in (Path(d.name) / 'sys/class/pps').iterdir():
+        if entry.name not in keep:
+            shutil.rmtree(entry)
+    return d
+
+def run_in(root, args, expected=0, scenario=None):
+    saved = os.environ['PPSBIAS_TEST_ROOT']
+    os.environ['PPSBIAS_TEST_ROOT'] = root
+    try:
+        return run(args, expected, scenario)
+    finally:
+        os.environ['PPSBIAS_TEST_ROOT'] = saved
+
+# Without -p, the PPS device is the only one with a device-tree GPIO.
+single = fixture_with('pps0', 'ptp')
+default = run_in(single.name, [fake, '-t', '4', '-v'])
+assert rows(default)[0]['pps'] == '/dev/pps0', default
+assert default.stdout == run_in(single.name, [fake, '-t', '4', '-v', '-p', '/dev/pps0']).stdout
+assert summary(default) == summary(run([fake, '-t', '4', '-v', '-p', '/dev/pps1']))
+r = run([fake, '-t', '4'], 1)
+assert 'more than one GPIO PPS device' in r.stderr and '/dev/pps0 /dev/pps1' in r.stderr and '-p' in r.stderr, r
+assert '/dev/ptp' not in r.stderr and not r.stdout, r
+none = fixture_with('ptp')
+r = run_in(none.name, [fake, '-t', '4'], 1)
+assert 'no GPIO PPS device found' in r.stderr and not r.stdout, r
 with tempfile.TemporaryDirectory() as empty:
-    os.environ['PPSBIAS_TEST_ROOT'] = empty
-    r = run([fake, '-m', 'rpi5', '-t', '4', '-v'], 1)
-    os.environ['PPSBIAS_TEST_ROOT'] = fixture.name
-    assert 'use -g' in r.stderr and not r.stdout, r
-for access in (['-c', 'fake', '-g', '18'], ['-m', 'rpi3', '-p', 'fakepps'],
-               ['-m', 'rpi4', '-p', 'fakepps'], ['-m', 'rpi5', '-p', 'fakepps']):
+    r = run_in(empty, [fake, '-t', '4'], 1)
+    assert 'no GPIO PPS device found' in r.stderr, r
+# The family comes from the controller node's compatible strings. The registers are read through
+# the family's gpiomem device or, without one, through /dev/mem at the translated address of the
+# node's first register range.
+for pps, family, device, controller, address in [
+        ('fakepps', 'rp1', '/dev/gpiomem0', '/axi/pcie@1000120000/rp1/gpio@d0000', None),
+        ('ppsbcm', 'bcm2835', '/dev/gpiomem', '/soc/gpio@7e200000', None),
+        ('pps2711', 'bcm2835', '/dev/gpiomem', '/soc4/gpio@7e200000', None),
+        ('ppsrk', 'rockchip', '/dev/mem', '/pinctrl/gpio@fdd60000', '0xfdd60000'),
+        ('ppsk3', 'k3', '/dev/mem', '/bus@f0000/gpio@601000', '0x601000')]:
+    r = run([fake, '-p', pps, '-t', '4', '-v'])
+    first = rows(r)[0]
+    assert first['access'] == family and first['device'] == device, first
+    assert first['controller'] == controller and first['gpio'] == '18', first
+    assert first.get('address') == address, first
+    assert 'median' in summary(r) and not r.stderr, r
+# Without the gpiomem device, the Pi's registers are read through /dev/mem.
+for pps, address in [('fakepps', '0x1f000d0000'), ('ppsbcm', '0x3f200000'), ('pps2711', '0xfe200000')]:
+    first = rows(run([fake, '-p', pps, '-t', '4', '-v'], 0, 'fallback'))[0]
+    assert first['device'] == '/dev/mem' and first['address'] == address, first
+r = run([fake, '-p', 'ppsrk', '-t', '4'], 1, 'rk_v1')
+assert 'unsupported Rockchip GPIO controller version' in r.stderr, r
+r = run([fake, '-p', 'ppsk3', '-t', '4'], 1, 'ti_pid')
+assert 'unsupported TI GPIO controller PID' in r.stderr, r
+for pps, why in [('ppslow', 'active low'), ('nosuchpps', 'cannot read the PPS device name'),
+                 ('ptp', 'no device-tree GPIO'), ('ppsnone', 'cannot find the GPIO controller'),
+                 ('ppsbad', 'not supported (compatible: brcm,brcmstb-gpio)'),
+                 ('ppsbcm54', 'outside the controller range'), ('ppsrk32', 'outside the controller range'),
+                 ('ppsk3big', 'outside the controller range'), ('ppsnoranges', 'no ranges property')]:
+    r = run([fake, '-p', pps, '-t', '4'], 1)
+    assert why in r.stderr and not r.stdout, (pps, r)
+# -m is obsolete: it is ignored, with a warning.
+r = run([fake, '-m', 'rpi5', '-p', 'fakepps', '-t', '4'])
+assert r.stderr == 'warning: -m is no longer needed and is ignored\n', r
+assert r.stdout == run([fake, '-p', 'fakepps', '-t', '4']).stdout
+for access in (['-c', 'fake', '-g', '18'], ['-p', 'fakepps'], ['-p', 'ppsbcm'], ['-p', 'ppsk3']):
     args = [fake, *access]
     for alternate in (False, True):
         mode = [] if alternate else ['-e']
@@ -126,7 +143,7 @@ for access in (['-c', 'fake', '-g', '18'], ['-m', 'rpi3', '-p', 'fakepps'],
         assert 'clock discontinuity detected' in result.stderr
         assert 'median=' not in result.stdout
 ioctl = [fake, '-c', 'fake', '-g', '18', '-t', '8', '-v', '-e']
-pps = [fake, '-m', 'rpi5', '-p', 'fakepps', '-t', '8', '-v', '-e']
+pps = [fake, '-p', 'fakepps', '-t', '8', '-v', '-e']
 for scenario in ('snapshot', 'offset', 'fallback', 'fresh', 'format_default'):
     r = run(pps, scenario=scenario)
     s = summary(r)
@@ -158,7 +175,7 @@ assert 'bracket=' in r.stdout and 'sourceStatus=missing_event' in r.stdout
 r = run([*ioctl, '-s', '0.5'])
 assert float(summary(r)['bracketMax']) > .0004  # valid wide brackets are retained
 # Warn on the median, in both output modes, without changing success or stdout.
-for access in (['-c', 'fake', '-g', '18'], ['-m', 'rpi5']):
+for access in (['-c', 'fake', '-g', '18'], ['-p', 'fakepps']):
     for mode in ([], ['-e']):
         for spacing in ('0.0014', '0.0015', '0.0016', '0.01'):
             args = [fake, *access, *mode, '-t', '4', '-s', spacing]

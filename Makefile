@@ -9,12 +9,13 @@ BINDIR = $(PREFIX)/bin
 INSTALL = install
 
 PROGRAMS = ppsbias ppsecho
+FAMILIES = $(wildcard families/*.c)
 
 .PHONY: all clean install uninstall check
 all: $(PROGRAMS)
 
-ppsbias: ppsbias.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS) -lm
+ppsbias: ppsbias.c $(FAMILIES) families/family.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ ppsbias.c $(FAMILIES) $(LDLIBS) -lm
 
 ppsecho: ppsecho.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)

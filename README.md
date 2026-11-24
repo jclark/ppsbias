@@ -60,52 +60,43 @@ sudo make install
 `ppsbias` outputs the median bias in seconds suitable for use in an NTP daemon configuration file.
 The result should always be positive meaning the timestamp is late: `12.7e-6` means 12.7 µs.
 
-Normal usage is to specify the `-m` option with the model of computer being used e.g.
+Normal usage is simply
 
 ```
-ppsbias -m rpi5
+ppsbias
 ```
 
-The other values allowed for `-m` are `rpi4`, `rpi3`, `rk35xx` and `tik3`.
 It will perform the estimate for 10 seconds.
 The `-v` verbose option will show more information. `-t 60` will run for 60 seconds.
 
 The full command line syntax is as follows.
 
 ```text
-ppsbias -m model [-p ppsdev] [-g gpio] [-t seconds] [-e] [-v] [-w ms] [-s ms]
+ppsbias [-p ppsdev] [-t seconds] [-e] [-v] [-w ms] [-s ms]
 ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w ms] [-s ms]
 ```
 
-Either `-m` or `-c` must be specified.
-`-m` is preferred: it reads GPIO registers while the PPS driver supplies timestamps.
-It is specific to Raspberry Pi, Rockchip RK35xx and TI K3 (e.g. AM67A on the BeagleY-AI) hardware.
+The first form is preferred: it reads the level of the PPS device's GPIO from the GPIO controller's registers while the PPS driver supplies timestamps.
+It finds the GPIO and its controller from the device tree.
+It supports the GPIO controllers of the Raspberry Pi 3, 4 and 5, Rockchip SoCs with GPIO v2 (such as the RK3566, RK3568 and RK3588) and TI K3 SoCs (such as the AM67A on the BeagleY-AI).
+On the Raspberry Pi the registers are read through `/dev/gpiomem` or `/dev/gpiomem0`, or `/dev/mem` if those are missing;
+on the others they are read through `/dev/mem`.
 `-c` is the portable backup, using GPIO ioctl reads and GPIO-event timestamps.
-The events take a similar interrupt path to PPS, giving an order-of-magnitude estimate; `-m` measures the actual PPS timestamps and usually gives much tighter polling brackets.
-
-`-m` *model*\
-Read GPIO registers for `rpi3`, `rpi4`, `rpi5`, `rk35xx` or `tik3`.
+The events take a similar interrupt path to PPS, giving an order-of-magnitude estimate; the first form measures the actual PPS timestamps and usually gives much tighter polling brackets.
 
 `-p` *ppsdev*\
-Read PPS assert timestamps from *ppsdev*.
-The default is `/dev/pps0`.
-Requires `-m`.
-*ppsdev* must be a GPIO PPS device.
+Read PPS assert timestamps from *ppsdev*, which must be a GPIO PPS device whose GPIO is given by the device tree.
+The default is the only such device;
+if there is more than one, `-p` is required.
+Cannot be combined with `-c`.
 
 `-c` *chip*\
 Read values and realtime rising-edge events from a GPIO v2 character device.
 Requires `-g` and a free GPIO.
-Cannot be combined with `-m` or `-p`.
 
 `-g` *gpio*\
-GPIO number within the controller, not a physical header pin number.
-With `-m` the default is the GPIO of the PPS device, taken from the device tree;
-if that cannot be determined, `-g` is required.
-With `-m`, the GPIO given by `-g` must be the one the PPS device uses.
-With `rk35xx`, GPIO*b*\_*Xn* is *b* × 32 + 8 × *X* + *n*, where *X* is 0–3 for A–D,
-e.g. GPIO3_A3 is 99, GPIO4_C6 is 150.
-With `tik3`, the GPIO controller can only be found from the device tree, so `-g` cannot replace it;
-*gpio* is the line within that controller, e.g. 11 for GPIO1_11.
+The line number within *chip*, not a physical header pin number.
+Requires `-c`.
 
 `-t` *seconds*\
 Measure for the specified duration after initial synchronization.
@@ -141,7 +132,7 @@ to see which CPU is handling the PPS interrupt. If several CPUs have non-zero co
 If this shows that, for example, CPU0 is handling the PPS interrupts, then use `taskset -c` to run on another CPU:
 
 ```
-taskset -c 3 ppsbias -m rpi5
+taskset -c 3 ppsbias
 ```
 
 Use the `performance` CPU frequency governor while measuring.

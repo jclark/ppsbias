@@ -28,33 +28,48 @@ int main(void)
 	assert(!strcmp(sequence_status(5, 3, true), "sequence_reset"));
 	assert(!strcmp(sequence_status(5, 7, true), "pps_sequence_gap"));
 	uint32_t mask;
-	assert(register_offset(&models[0], 53, &mask) == 0x38 && mask == (1u << 21));
-	assert(register_offset(&models[1], 57, &mask) == 0x38 && mask == (1u << 25));
-	assert(register_offset(&models[2], 28, &mask) == 0x14008 && mask == 1);
-	assert(register_offset(&models[2], 53, &mask) == 0x18008 && mask == (1u << 19));
-	assert(register_offset(&models[3], 99, &mask) == 0x70 && mask == (1u << 3));
-	assert(register_offset(&models[4], 11, &mask) == 0x20 && mask == (1u << 11));
-	assert(register_offset(&models[4], 72, &mask) == 0x70 && mask == (1u << 8));
-	/* rk35xx bank lookup against the synthetic device tree from fixture.sh. */
-	char root[] = "/tmp/ppsbias-unit-XXXXXX", cmd[256], dt[64], sys[64];
+	assert(bcm2835.level(53, &mask) == 0x38 && mask == (1u << 21));
+	assert(bcm2835.level(57, &mask) == 0x38 && mask == (1u << 25));
+	assert(rp1.level(27, &mask) == 0x10008 && mask == (1u << 27));
+	assert(rp1.level(28, &mask) == 0x14008 && mask == 1);
+	assert(rp1.level(53, &mask) == 0x18008 && mask == (1u << 19));
+	assert(rockchip.level(24, &mask) == 0x70 && mask == (1u << 24));
+	assert(k3.level(11, &mask) == 0x20 && mask == (1u << 11));
+	assert(k3.level(72, &mask) == 0x70 && mask == (1u << 8));
+	uint32_t regs[0x20] = {0};
+	regs[0x78 / 4] = 0x01000c2b;
+	assert(!rockchip.check((volatile char *)regs));
+	regs[0x78 / 4] = 0;
+	assert(!strcmp(rockchip.check((volatile char *)regs), "unsupported Rockchip GPIO controller version 0x00000000"));
+	regs[0] = 0x44832905;
+	assert(!k3.check((volatile char *)regs));
+	/* Lookup and address translation against the synthetic device tree from fixture.sh. */
+	char root[] = "/tmp/ppsbias-unit-XXXXXX", cmd[256], dt[64], sys[64], real[PATH_MAX];
 	assert(mkdtemp(root));
 	snprintf(cmd, sizeof cmd, "./fixture.sh %s", root);
 	assert(system(cmd) == 0);
 	snprintf(dt, sizeof dt, "%s/dt", root); snprintf(sys, sizeof sys, "%s/sys", root);
 	dt_root = dt; sys_root = sys;
-	uint64_t base = 0, gpio = 0;
-	uint32_t phandle = 0, line = 0;
-	bool hard = false;
-	assert(rk_bank(3, &base, &phandle) && base == UINT64_C(0xfe760000) && phandle == 0x53);
-	assert(rk_bank(0, &base, &phandle) && base == UINT64_C(0xfdd60000) && phandle == 0x22);
-	assert(!rk_bank(1, &base, &phandle));
-	assert(!pps_gpio("ppsrk3", &phandle, &line, &hard) && phandle == 0x53 && line == 3);
-	assert(!model_gpio(&models[3], phandle, line, &gpio, &base, &hard) && gpio == 99);
-	assert(model_gpio(&models[3], 7, 18, &gpio, &base, &hard));
-	assert(!pps_gpio("ppsk3", &phandle, &line, &hard) && phandle == 0x31 && line == 18);
-	assert(!model_gpio(&models[4], phandle, line, &gpio, &base, &hard) && gpio == 18 && base == 0x601000);
-	assert(!strcmp(model_gpio(&models[4], 7, 18, &gpio, &base, &hard), "PPS GPIO controller is not a TI Keystone GPIO"));
-	assert(model_gpio(&models[4], 0x99, 18, &gpio, &base, &hard));
+	assert(realpath(dt, real));
+	static const struct { const char *pps; const struct family *family; const char *node; unsigned line; uint64_t base, size; } cases[] = {
+		{ "pps0", &rp1, "/axi/pcie@1000120000/rp1/gpio@d0000", 18, UINT64_C(0x1f000d0000), 0xc000 },
+		{ "ppsbcm", &bcm2835, "/soc/gpio@7e200000", 18, 0x3f200000, 0xb4 },
+		{ "pps2711", &bcm2835, "/soc4/gpio@7e200000", 18, 0xfe200000, 0xb4 },
+		{ "ppsrk3", &rockchip, "/pinctrl/gpio@fe760000", 3, 0xfe760000, 0x100 },
+		{ "ppsk3", &k3, "/bus@f0000/gpio@601000", 18, 0x601000, 0x100 },
+	};
+	for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+		struct controller ctl;
+		uint64_t base, size;
+		assert(!locate(cases[i].pps, &ctl));
+		assert(ctl.family == cases[i].family && ctl.line == cases[i].line && !strcmp(ctl.node + ctl.root_len, cases[i].node));
+		assert(!translate(ctl.node, real, &base, &size) && base == cases[i].base && size == cases[i].size);
+	}
+	struct controller ctl;
+	uint64_t base, size;
+	assert(!locate("ppsnoranges", &ctl) && strstr(translate(ctl.node, real, &base, &size), "no ranges"));
+	assert(strstr(locate("ppsk3big", &ctl), "outside the controller range"));
+	assert(strstr(locate("ppsbad", &ctl), "not supported"));
 	snprintf(cmd, sizeof cmd, "rm -r %s", root);
 	assert(system(cmd) == 0);
 	char *output = NULL;

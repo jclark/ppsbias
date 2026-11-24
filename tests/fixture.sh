@@ -1,48 +1,90 @@
 #!/bin/sh
-# Build a synthetic /sys and /proc/device-tree under $1 for the PPS GPIO lookup.
-# pps0, pps1 and fakepps are pps-gpio devices on line 18 of the controller
-# labelled gpio and rp1_gpio (phandle 7); ppslow is the same line active low.
+# Build a synthetic /sys and device tree under $1 for finding a PPS device's GPIO controller.
+#
+# GPIO controllers (phandle: family, node, CPU address of its first register range):
+#   7:    bcm2835 /soc/gpio@7e200000, Pi 3 bus ranges, 0x3f200000
+#   8:    bcm2711 /soc4/gpio@7e200000, Pi 4 bus ranges, 0xfe200000
+#   9:    rp1 /axi/pcie@1000120000/rp1/gpio@d0000, the Pi 5's PCIe ranges, 0x1f000d0000
+#   0x22: rockchip /pinctrl/gpio@fdd60000, empty ranges, 0xfdd60000
+#   0x53: rockchip /pinctrl/gpio@fe760000, 0xfe760000
+#   0x31: k3 /bus@f0000/gpio@601000, ti,ngpio 73, 0x601000
+#   0x40: unsupported brcm,brcmstb-gpio
+#   0x41: rockchip under a bus with no ranges, so untranslatable
+# PPS devices (/sys/class/pps entries) with a device-tree GPIO (phandle, line, flags):
+#   pps0, pps1, fakepps: 9 18 0 (one platform device); ppslow: 9 18 1 (active low)
+#   ppsbcm: 7 18; ppsbcm54: 7 54; pps2711: 8 18; ppsrk: 0x22 18; ppsrk3: 0x53 3;
+#   ppsrk32: 0x22 32; ppsk3: 0x31 18; ppsk3big: 0x31 73; ppsbad: 0x40 18;
+#   ppsnone: 0x99 18; ppsnoranges: 0x41 18
+# and without one: ptp, a PTP clock's PPS device.
 set -e
 cd "$1"
-mkdir -p dt/__symbols__ dt/soc/gpio dt/pps sys/class/pps sys/bus/platform/devices
-cell() { printf "\\$(printf %o $(($1 >> 24 & 255)))\\$(printf %o $(($1 >> 16 & 255)))\\$(printf %o $(($1 >> 8 & 255)))\\$(printf %o $(($1 & 255)))"; }
-printf '/soc/gpio\0' > dt/__symbols__/gpio
-printf '/soc/gpio\0' > dt/__symbols__/rp1_gpio
-cell 7 > dt/soc/gpio/phandle
-for dev in pps0 pps1 fakepps; do mkdir -p sys/class/pps/$dev; echo 'pps@12.-1' > sys/class/pps/$dev/name; done
-mkdir -p sys/class/pps/ppslow dt/ppslow sys/bus/platform/devices/pps@12 sys/bus/platform/devices/ppslow
-echo 'ppslow.-1' > sys/class/pps/ppslow/name
-{ cell 7; cell 18; cell 0; } > dt/pps/gpios
-{ cell 7; cell 18; cell 1; } > dt/ppslow/gpios
-ln -s ../../../../../dt/pps sys/bus/platform/devices/pps@12/of_node
-ln -s ../../../../../dt/ppslow sys/bus/platform/devices/ppslow/of_node
-# Rockchip GPIO v2 banks 0 and 3 (aliases gpio0, gpio3); ppsrk is line 18 of bank 0,
-# ppsrk3 is line 3 of bank 3 (GPIO3_A3 = 99).
-mkdir -p dt/aliases dt/pinctrl/gpio@fdd60000 dt/pinctrl/gpio@fe760000 dt/ppsrk dt/ppsrk3
-printf '/pinctrl/gpio@fdd60000\0' > dt/aliases/gpio0
-printf '/pinctrl/gpio@fe760000\0' > dt/aliases/gpio3
-{ cell 0; cell 0xfdd60000; cell 0; cell 0x100; } > dt/pinctrl/gpio@fdd60000/reg
-{ cell 0; cell 0xfe760000; cell 0; cell 0x100; } > dt/pinctrl/gpio@fe760000/reg
-cell 0x22 > dt/pinctrl/gpio@fdd60000/phandle
-cell 0x53 > dt/pinctrl/gpio@fe760000/phandle
-{ cell 0x22; cell 18; cell 0; } > dt/ppsrk/gpios
-{ cell 0x53; cell 3; cell 0; } > dt/ppsrk3/gpios
-for dev in ppsrk ppsrk3; do
-	mkdir -p sys/class/pps/$dev sys/bus/platform/devices/$dev
-	echo "$dev.-1" > sys/class/pps/$dev/name
-	ln -s ../../../../../dt/$dev sys/bus/platform/devices/$dev/of_node
-done
-# TI K3 Keystone GPIO main_gpio1 (phandle 0x31); ppsk3 is its line 18.
-# ppsk3bad is line 18 of the controller labelled gpio, which is not a Keystone GPIO.
-mkdir -p dt/bus/gpio@601000 dt/ppsk3 dt/ppsk3bad
-printf '/bus/gpio@601000\0' > dt/__symbols__/main_gpio1
-printf 'ti,am64-gpio\0ti,keystone-gpio\0' > dt/bus/gpio@601000/compatible
-{ cell 0; cell 0x601000; cell 0; cell 0x100; } > dt/bus/gpio@601000/reg
-cell 0x31 > dt/bus/gpio@601000/phandle
-{ cell 0x31; cell 18; cell 0; } > dt/ppsk3/gpios
-{ cell 7; cell 18; cell 0; } > dt/ppsk3bad/gpios
-for dev in ppsk3 ppsk3bad; do
-	mkdir -p sys/class/pps/$dev sys/bus/platform/devices/$dev
-	echo "$dev.-1" > sys/class/pps/$dev/name
-	ln -s ../../../../../dt/$dev sys/bus/platform/devices/$dev/of_node
-done
+cell() { for c; do printf "\\$(printf %o $((c >> 24 & 255)))\\$(printf %o $((c >> 16 & 255)))\\$(printf %o $((c >> 8 & 255)))\\$(printf %o $((c & 255)))"; done; }
+bus() { mkdir -p "dt$1"; cell "$2" > "dt$1/#address-cells"; cell "$3" > "dt$1/#size-cells"; }
+chip=0
+# controller node phandle compatible reg...
+controller() {
+	node=$1 phandle=$2 compatible=$3; shift 3
+	mkdir -p "dt$node"
+	cell "$phandle" > "dt$node/phandle"
+	printf "$compatible\0" > "dt$node/compatible"
+	cell "$@" > "dt$node/reg"
+	mkdir -p sys/bus/gpio/devices/gpiochip$chip
+	ln -s "../../../../../dt$node" sys/bus/gpio/devices/gpiochip$chip/of_node
+	chip=$((chip + 1))
+}
+bus '' 2 2
+bus /soc 1 1
+cell 0x7e000000 0 0x3f000000 0x01000000 > dt/soc/ranges
+controller /soc/gpio@7e200000 7 brcm,bcm2835-gpio 0x7e200000 0xb4
+bus /soc4 1 1
+cell 0x7e000000 0 0xfe000000 0x01800000 0x7c000000 0 0xfc000000 0x02000000 \
+	0x40000000 0 0xff800000 0x00800000 > dt/soc4/ranges
+controller /soc4/gpio@7e200000 8 brcm,bcm2711-gpio 0x7e200000 0xb4
+bus /axi 2 2
+cell 0 0 0 0 0x10 0 0x10 0 0x10 0 1 0 0x14 0 0x14 0 4 0 0x18 0 0x18 0 4 0 0x1c 0 0x1c 0 4 0 > dt/axi/ranges
+bus /axi/pcie@1000120000 3 2
+cell 0x02000000 0 0 0x1f 0 0 0xfffffffc 0x43000000 4 0 0x1c 0 3 0 > dt/axi/pcie@1000120000/ranges
+bus /axi/pcie@1000120000/rp1 2 2
+cell 0xc0 0x40000000 0x02000000 0 0 0 0x00410000 > dt/axi/pcie@1000120000/rp1/ranges
+controller /axi/pcie@1000120000/rp1/gpio@d0000 9 raspberrypi,rp1-gpio \
+	0xc0 0x400d0000 0 0xc000 0xc0 0x400e0000 0 0xc000 0xc0 0x400f0000 0 0xc000
+bus /pinctrl 2 2
+: > dt/pinctrl/ranges
+controller /pinctrl/gpio@fdd60000 0x22 rockchip,gpio-bank 0 0xfdd60000 0 0x100
+controller /pinctrl/gpio@fe760000 0x53 rockchip,gpio-bank 0 0xfe760000 0 0x100
+bus /bus@f0000 2 2
+cell 0 0x600000 0 0x600000 0 0x1100 > dt/bus@f0000/ranges
+controller /bus@f0000/gpio@601000 0x31 'ti,am64-gpio\0ti,keystone-gpio' 0 0x601000 0 0x100
+cell 73 > dt/bus@f0000/gpio@601000/ti,ngpio
+controller /soc5/gpio@7d508500 0x40 brcm,brcmstb-gpio 0 0x7d508500 0 0x40
+bus /noranges 1 1
+controller /noranges/gpio@1000 0x41 rockchip,gpio-bank 0x1000 0x100
+# A gpiochip whose node has no compatible or phandle, like a gpiolib shared proxy.
+mkdir -p sys/bus/gpio/devices/gpiochip$chip/of_node
+# pps entry platform-device phandle line flags
+pps() {
+	mkdir -p "sys/class/pps/$1"
+	echo "$2.-1" > "sys/class/pps/$1/name"
+	if [ ! -e "sys/bus/platform/devices/$2" ]; then
+		mkdir -p "dt/$2" "sys/bus/platform/devices/$2"
+		cell "$3" "$4" "$5" > "dt/$2/gpios"
+		ln -s "../../../../../dt/$2" "sys/bus/platform/devices/$2/of_node"
+	fi
+}
+pps pps0 pps@12 9 18 0
+pps pps1 pps@12
+pps fakepps pps@12
+pps ppslow ppslow 9 18 1
+pps ppsbcm ppsbcm 7 18 0
+pps ppsbcm54 ppsbcm54 7 54 0
+pps pps2711 pps2711 8 18 0
+pps ppsrk ppsrk 0x22 18 0
+pps ppsrk3 ppsrk3 0x53 3 0
+pps ppsrk32 ppsrk32 0x22 32 0
+pps ppsk3 ppsk3 0x31 18 0
+pps ppsk3big ppsk3big 0x31 73 0
+pps ppsbad ppsbad 0x40 18 0
+pps ppsnone ppsnone 0x99 18 0
+pps ppsnoranges ppsnoranges 0x41 18 0
+mkdir -p sys/class/pps/ptp
+echo ptp0 > sys/class/pps/ptp/name

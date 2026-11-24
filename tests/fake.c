@@ -13,6 +13,7 @@
 #define fflush fake_fflush
 #define mmap fake_mmap
 #define munmap fake_munmap
+#define sysconf fake_sysconf
 #include "ppsbias.c"
 #undef main
 #include <assert.h>
@@ -40,8 +41,8 @@ static void advance(int64_t t)
 	uint32_t value = tick % NS < NS / 2 ? 1u << 18 : 0;
 	memcpy(registers + 0x34, &value, 4);
 	memcpy(registers + 0x10008, &value, 4);
-	memcpy(registers + 0x70, &value, 4); /* rk35xx GPIO_EXT_PORT */
-	memcpy(registers + 0x20, &value, 4); /* tik3 GPIO_IN_DATA01 */
+	memcpy(registers + 0x70, &value, 4); /* Rockchip GPIO_EXT_PORT */
+	memcpy(registers + 0x20, &value, 4); /* TI Keystone GPIO_IN_DATA01 */
 }
 static int64_t bias_for(int64_t edge)
 {
@@ -68,7 +69,7 @@ int fake_open(const char *path, int flags, ...)
 		if (is("denied")) { errno = EACCES; return -1; }
 		return 102;
 	}
-	if (!strcmp(path, "/dev/mem")) { assert(is("fallback") || is("rk") || is("rk_v1") || is("ti") || is("ti_pid")); return 102; }
+	if (!strcmp(path, "/dev/mem")) { assert((flags & O_ACCMODE) == O_RDONLY); return 104; }
 	if (strstr(path, "pps")) { assert((flags & O_ACCMODE) == O_RDONLY); return 103; }
 	return 100;
 }
@@ -81,21 +82,23 @@ int fake_fflush(FILE *f)
 }
 int fake_close(int fd)
 {
-	assert(fd >= 100 && fd <= 103);
+	assert(fd >= 100 && fd <= 104);
 	if (is("cleanup") && (fd == 101 || fd == 103)) { errno = EIO; return -1; }
 	return 0;
 }
 void *fake_mmap(void *a, size_t len, int prot, int flags, int fd, off_t off)
 {
-	(void)a; assert(len <= sizeof registers && prot == PROT_READ && flags == MAP_SHARED && fd == 102);
-	assert(off == (is("fallback") ? (off_t)0x1f000d0000 : is("rk") || is("rk_v1") ? (off_t)0xfdd60000 :
-		       is("ti") || is("ti_pid") ? (off_t)0x601000 : 0));
-	uint32_t version = is("rk_v1") ? 0 : 0x01000c2b; /* rk35xx GPIO_VERSION_ID */
+	/* A gpiomem device (102) maps from its start; /dev/mem (104) at the address, which fake.py checks. */
+	(void)a; assert(len <= sizeof registers && prot == PROT_READ && flags == MAP_SHARED);
+	assert((fd == 102 && off == 0) || fd == 104);
+	uint32_t version = is("rk_v1") ? 0 : 0x01000c2b; /* Rockchip GPIO_VERSION_ID */
 	memcpy(registers + 0x78, &version, 4);
-	uint32_t pid = is("ti_pid") ? 0x44822905 : 0x44832905; /* tik3 GPIO_PID */
+	uint32_t pid = is("ti_pid") ? 0x44822905 : 0x44832905; /* TI Keystone GPIO_PID */
 	memcpy(registers, &pid, 4);
 	return registers;
 }
+/* A fixed page size, so the register image's place in a mapping does not depend on the host's. */
+long fake_sysconf(int name) { assert(name == _SC_PAGESIZE); return 4096; }
 int fake_munmap(void *a, size_t len) { assert(a == registers && len > 0); return 0; }
 int fake_ioctl(int fd, unsigned long request, ...)
 {

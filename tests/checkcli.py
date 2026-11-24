@@ -16,17 +16,15 @@ for tool in ('ppsbias', 'ppsecho'):
 run(['./ppsecho'], 2)
 run(['./ppsecho', 'a', 'b'], 2)
 base = ['./ppsbias', '-c', '/dev/null', '-g', '18', '-t', '1']
-for opts in ([], ['-t', '1'], ['-c', '/dev/null', '-t', '1'],
-             ['-m', 'bad', '-p', '/dev/null', '-t', '1'],
-             ['-m', 'rpi5', '-p', '', '-t', '1'],
-             ['-p', '/dev/null', '-t', '1'],
-             ['-m', 'rpi3', '-p', '/dev/null', '-g', '54', '-t', '1'],
-             ['-m', 'rpi4', '-p', '/dev/null', '-g', '58', '-t', '1'],
-             ['-m', 'rpi5', '-p', '/dev/null', '-g', '54', '-t', '1'],
-             ['-m', 'rk35xx', '-p', '/dev/null', '-g', '320', '-t', '1'],
-             ['-m', 'tik3', '-p', '/dev/null', '-g', '160', '-t', '1']):
+for opts in (['-c', '/dev/null', '-t', '1'], ['-g', '18', '-t', '1'],
+             ['-p', '', '-t', '1'], ['-p', '/dev/null', '-g', '18', '-t', '1'],
+             ['-m', 'rpi5', '-p', '', '-t', '1']):
     run(['./ppsbias', *opts], 2)
-for opts in (['-m', 'rpi3'], ['-p', '/dev/null'], ['-d', '1'], ['-l', '18'],
+# -m is obsolete and ignored, with a warning; these then fail on the device, not a PPS device.
+for opts in (['-m', 'bad', '-p', '/dev/null', '-t', '1'], ['-p', '/dev/null', '-t', '1']):
+    result = run(['./ppsbias', *opts], 1)
+    assert ('warning: -m is no longer needed' in result.stderr) == ('-m' in opts), result
+for opts in (['-p', '/dev/null'], ['-d', '1'], ['-l', '18'],
              ['-P', 'a:18'], ['-j'], ['-a'], ['extra']):
     run([*base, *opts], 2)
 for option, invalid in {
