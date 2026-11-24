@@ -23,7 +23,11 @@ static const int64_t epoch = 1000 * NS;
 static const char *scenario;
 static uint32_t seq;
 static int64_t last_assert = 9 * NS;
-static unsigned char registers[0x40000];
+/* The controller's registers, from the start of its first register range, which is at physical
+ * address PPSBIAS_TEST_ADDRESS; the memory before them lets a mapping start up to 64 KiB earlier. */
+#define REGISTERS 0x40000
+static unsigned char memory[0x10000 + REGISTERS];
+static unsigned char *const registers = memory + 0x10000;
 static bool extra_done, wide_done;
 static int last_idx;
 static bool is(const char *s) { return scenario && !strcmp(scenario, s); }
@@ -41,7 +45,8 @@ static void advance(int64_t t)
 	uint32_t value = tick % NS < NS / 2 ? 1u << 18 : 0;
 	memcpy(registers + 0x34, &value, 4);
 	memcpy(registers + 0x10008, &value, 4);
-	memcpy(registers + 0x70, &value, 4); /* Rockchip GPIO_EXT_PORT */
+	memcpy(registers + 0x70, &value, 4); /* Rockchip GPIO v2 GPIO_EXT_PORT */
+	memcpy(registers + 0x50, &value, 4); /* Rockchip GPIO v1 GPIO_EXT_PORT */
 	memcpy(registers + 0x20, &value, 4); /* TI Keystone GPIO_IN_DATA01 */
 	memcpy(registers + 0x08, &value, 4); /* i.MX GPIO_PSR */
 }
@@ -66,7 +71,7 @@ int fake_open(const char *path, int flags, ...)
 {
 	if (strstr(path, "gpiomem")) {
 		assert((flags & O_ACCMODE) == O_RDONLY);
-		if (is("fallback")) { errno = ENOENT; return -1; }
+		if (is("fallback") || is("fallback_strict")) { errno = ENOENT; return -1; }
 		if (is("denied")) { errno = EACCES; return -1; }
 		return 102;
 	}
@@ -87,21 +92,31 @@ int fake_close(int fd)
 	if (is("cleanup") && (fd == 101 || fd == 103)) { errno = EIO; return -1; }
 	return 0;
 }
+/* A fixed page size, so that the tests do not depend on the host's; 16 KiB in scenario page16k. */
+long fake_sysconf(int name) { assert(name == _SC_PAGESIZE); return is("page16k") ? 16384 : 4096; }
 void *fake_mmap(void *a, size_t len, int prot, int flags, int fd, off_t off)
 {
-	/* A gpiomem device (102) maps from its start; /dev/mem (104) at the address, which fake.py checks. */
-	(void)a; assert(len <= sizeof registers && prot == PROT_READ && flags == MAP_SHARED);
-	assert((fd == 102 && off == 0) || fd == 104);
-	if (fd == 104 && is("io_strict")) { errno = EPERM; return MAP_FAILED; }
-	uint32_t version = is("rk_v1") ? 0 : 0x01000c2b; /* Rockchip GPIO_VERSION_ID */
+	(void)a; assert(prot == PROT_READ && flags == MAP_SHARED);
+	uint32_t version = is("rk_v1") ? 0 : is("rk_unknown") ? 0x12345678 : 0x01000c2b; /* Rockchip GPIO_VERSION_ID */
 	memcpy(registers + 0x78, &version, 4);
 	uint32_t pid = is("ti_pid") ? 0x44822905 : 0x44832905; /* TI Keystone GPIO_PID */
 	memcpy(registers, &pid, 4);
-	return registers;
+	/* A gpiomem device (102) maps its whole window, from the start of the first register range. */
+	if (fd == 102) { assert(off == 0 && len <= REGISTERS); return registers; }
+	/* /dev/mem (104) maps one page, at the physical address of the registers it holds. */
+	assert(fd == 104 && len == (size_t)fake_sysconf(_SC_PAGESIZE) && off % (off_t)len == 0);
+	if (is("io_strict") || is("fallback_strict")) { errno = EPERM; return MAP_FAILED; }
+	const char *base = getenv("PPSBIAS_TEST_ADDRESS");
+	assert(base);
+	int64_t from = (int64_t)off - (int64_t)strtoull(base, NULL, 0);
+	assert(from >= -0x10000 && from + (int64_t)len <= REGISTERS);
+	return registers + from;
 }
-/* A fixed page size, so the register image's place in a mapping does not depend on the host's. */
-long fake_sysconf(int name) { assert(name == _SC_PAGESIZE); return 4096; }
-int fake_munmap(void *a, size_t len) { assert(a == registers && len > 0); return 0; }
+int fake_munmap(void *a, size_t len)
+{
+	assert((unsigned char *)a >= memory && (unsigned char *)a + len <= memory + sizeof memory);
+	return 0;
+}
 int fake_ioctl(int fd, unsigned long request, ...)
 {
 	va_list ap; va_start(ap, request); void *arg = va_arg(ap, void *); va_end(ap);

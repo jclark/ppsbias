@@ -13,8 +13,16 @@ fixture = tempfile.TemporaryDirectory()
 subprocess.run([str(Path(__file__).resolve().parent / 'fixture.sh'), fixture.name], check=True)
 os.environ['PPSBIAS_TEST_ROOT'] = fixture.name
 
+# The physical address of the start of each fixture controller's first register range, where the
+# fake places the controller's registers when they are mapped through /dev/mem.
+ADDRESSES = {'pps0': 0x1f000d0000, 'pps1': 0x1f000d0000, 'fakepps': 0x1f000d0000,
+             'ppsmain': 0x1f000d0000, 'ppsbcm': 0x3f200000, 'pps2711': 0xfe200000,
+             'ppsrk': 0xfdd60000, 'ppsk3': 0x601000, 'ppsmxc': 0x30200000}
+
 def run(args, expected=0, scenario=None, **kwargs):
-    env = {**os.environ, 'PPSBIAS_TEST': scenario or ''}
+    pps = args[args.index('-p') + 1] if '-p' in args else 'pps0'
+    env = {**os.environ, 'PPSBIAS_TEST': scenario or '',
+           'PPSBIAS_TEST_ADDRESS': hex(ADDRESSES.get(Path(pps).name, 0))}
     result = subprocess.run(args, cwd=root, text=True, capture_output=True,
                             timeout=15, env=env, **kwargs)
     assert result.returncode == expected, (args, scenario, result)
@@ -46,7 +54,7 @@ def run_in(root, args, expected=0, scenario=None):
     finally:
         os.environ['PPSBIAS_TEST_ROOT'] = saved
 
-# Without -p, the PPS device is the only one with a device-tree GPIO.
+# Without -p, the PPS device is the only pps-gpio device.
 single = fixture_with('pps0', 'ptp')
 default = run_in(single.name, [fake, '-t', '4', '-v'])
 assert rows(default)[0]['pps'] == '/dev/pps0', default
@@ -61,34 +69,42 @@ assert 'no GPIO PPS device found' in r.stderr and not r.stdout, r
 with tempfile.TemporaryDirectory() as empty:
     r = run_in(empty, [fake, '-t', '4'], 1)
     assert 'no GPIO PPS device found' in r.stderr, r
-# The backend comes from the controller node's compatible strings. The registers are read through
-# the backend's gpiomem device or, without one, through /dev/mem at the translated address of the
-# node's first register range.
-for pps, backend, device, controller, address in [
-        ('fakepps', 'rp1', '/dev/gpiomem0', '/axi/pcie@1000120000/rp1/gpio@d0000', None),
-        ('ppsbcm', 'bcm2835', '/dev/gpiomem', '/soc/gpio@7e200000', None),
-        ('pps2711', 'bcm2835', '/dev/gpiomem', '/soc4/gpio@7e200000', None),
-        ('ppsrk', 'rockchip', '/dev/mem', '/pinctrl/gpio@fdd60000', '0xfdd60000'),
-        ('ppsk3', 'k3', '/dev/mem', '/bus@f0000/gpio@601000', '0x601000'),
-        ('ppsmxc', 'mxc', '/dev/mem', '/soc@0/bus@30000000/gpio@30200000', '0x30200000')]:
-    r = run([fake, '-p', pps, '-t', '4', '-v'])
+# The backend comes from the controller node's compatible strings. The input register is read
+# through the backend's gpiomem device or, without one, through /dev/mem at its translated
+# address, which the fake checks is where mmap maps it.
+for pps, backend, device, controller, address, scenario in [
+        ('fakepps', 'rp1', '/dev/gpiomem0', '/axi/pcie@1000120000/rp1/gpio@d0000', None, None),
+        ('ppsbcm', 'bcm2835', '/dev/gpiomem', '/soc/gpio@7e200000', None, None),
+        ('pps2711', 'bcm2835', '/dev/gpiomem', '/soc4/gpio@7e200000', None, None),
+        ('ppsrk', 'rockchip', '/dev/mem', '/pinctrl/gpio@fdd60000', '0xfdd60070', None),
+        ('ppsrk', 'rockchip', '/dev/mem', '/pinctrl/gpio@fdd60000', '0xfdd60050', 'rk_v1'),
+        ('ppsk3', 'k3', '/dev/mem', '/bus@f0000/gpio@601000', '0x601020', None),
+        ('ppsk3', 'k3', '/dev/mem', '/bus@f0000/gpio@601000', '0x601020', 'page16k'),
+        ('ppsmxc', 'mxc', '/dev/mem', '/soc@0/bus@30000000/gpio@30200000', '0x30200008', None)]:
+    r = run([fake, '-p', pps, '-t', '4', '-v'], 0, scenario)
     first = rows(r)[0]
     assert first['access'] == backend and first['device'] == device, first
     assert first['controller'] == controller and first['gpio'] == '18', first
     assert first.get('address') == address, first
     assert 'median' in summary(r) and not r.stderr, r
-# Without the gpiomem device, the Pi's registers are read through /dev/mem.
-for pps, address in [('fakepps', '0x1f000d0000'), ('ppsbcm', '0x3f200000'), ('pps2711', '0xfe200000')]:
+# Without the gpiomem device, as with a mainline kernel, the Pi's input register is read through
+# /dev/mem; on the Pi 5 it is in RP1's second register range, and mainline describes RP1's
+# addresses differently from the Raspberry Pi kernel.
+for pps, address in [('fakepps', '0x1f000e0008'), ('ppsmain', '0x1f000e0008'),
+                     ('ppsbcm', '0x3f200034'), ('pps2711', '0xfe200034')]:
     first = rows(run([fake, '-p', pps, '-t', '4', '-v'], 0, 'fallback'))[0]
     assert first['device'] == '/dev/mem' and first['address'] == address, first
 r = run([fake, '-p', 'ppsrk', '-t', '4'], 1, 'io_strict')
 assert 'Operation not permitted' in r.stderr and 'iomem=relaxed' in r.stderr and not r.stdout, r
-r = run([fake, '-p', 'ppsrk', '-t', '4'], 1, 'rk_v1')
-assert 'unsupported Rockchip GPIO controller version' in r.stderr, r
+r = run([fake, '-p', 'ppsrk', '-t', '4'], 1, 'rk_unknown')
+assert 'unsupported rockchip GPIO controller (identification register 0x12345678)' in r.stderr, r
 r = run([fake, '-p', 'ppsk3', '-t', '4'], 1, 'ti_pid')
-assert 'unsupported TI GPIO controller PID' in r.stderr, r
+assert 'unsupported k3 GPIO controller (identification register 0x44822905)' in r.stderr, r
+r = run([fake, '-p', 'ppsmain', '-t', '4'], 1, 'fallback_strict')
+assert '(/dev/gpiomem0 does not exist, so /dev/mem was used)' in r.stderr, r
 for pps, why in [('ppslow', 'active low'), ('nosuchpps', 'cannot read the PPS device name'),
-                 ('ptp', 'no device-tree GPIO'), ('ppsnone', 'cannot find the GPIO controller'),
+                 ('ptp', 'not a pps-gpio device'), ('ppsother', 'not a pps-gpio device'),
+                 ('ppsnone', 'cannot find the GPIO controller'), ('ppscells', 'two GPIO cells'),
                  ('ppsbad', 'not supported (compatible: brcm,brcmstb-gpio)'),
                  ('ppsbcm54', 'outside the controller range'), ('ppsrk32', 'outside the controller range'),
                  ('ppsk3big', 'outside the controller range'), ('ppsnoranges', 'no ranges property')]:

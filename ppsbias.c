@@ -184,12 +184,12 @@ static unsigned bus_cells(const char *node, const char *root, const char *name)
 	return 1;
 }
 
-/* An address of na cells. Three cells are a PCI address: *space is the first cell, whose
- * space code says which address space the other two are in. */
-static bool address(const uint32_t *c, unsigned na, uint32_t *space, uint64_t *value)
+/* An address of na cells. With three, *hi is the first cell, which holds flags, and *value
+ * the other two; with fewer, *hi is 0. */
+static bool address(const uint32_t *c, unsigned na, uint32_t *hi, uint64_t *value)
 {
 	if (na < 1 || na > 3) return false;
-	*space = na == 3 ? c[0] : 0;
+	*hi = na == 3 ? c[0] : 0;
 	*value = na == 1 ? c[0] : (uint64_t)c[na - 2] << 32 | c[na - 1];
 	return true;
 }
@@ -201,38 +201,85 @@ static bool length(const uint32_t *c, unsigned ns, uint64_t *value)
 	return true;
 }
 
-/* The CPU physical address and size of a node's first register range: its reg translated
- * through the ranges of each parent bus, as the Devicetree Specification defines. Returns
- * NULL, or why not. On a bus whose children have three address cells, taken to be PCI, a
- * range matches on the space code as well as the address, as in Linux. */
-static const char *translate(const char *node, const char *root, uint64_t *base, uint64_t *size)
+/* How Linux (drivers/of/address.c) matches an address against a bus node's ranges. A PCI bus,
+ * known by its device_type or a node name of pcie, compares only the PCI address space (I/O,
+ * memory or configuration) given by the first of its three address cells. Another bus with
+ * three address cells of its own compares the first cell, which holds flags, exactly. Any
+ * other bus compares plain addresses. */
+enum bus_kind { PLAIN_BUS, FLAGS_BUS, PCI_BUS };
+
+static enum bus_kind bus_kind(const char *node)
+{
+	static const char *const pci[] = { "pci", "pciex", "vci", "ht" };
+	char path[PATH_MAX], type[16];
+	long n = format(path, sizeof path, "%s/device_type", node) ? read_file(path, type, sizeof type - 1) : -1;
+	if (n > 0) {
+		type[n] = 0;
+		for (size_t i = 0; i < sizeof pci / sizeof pci[0]; i++)
+			if (!strcmp(type, pci[i])) return PCI_BUS;
+	}
+	const char *name = strrchr(node, '/') ? strrchr(node, '/') + 1 : node;
+	if (strcspn(name, "@") == 4 && !strncmp(name, "pcie", 4)) return PCI_BUS;
+	uint32_t cells;
+	return property_cells(node, "#address-cells", &cells, 1) == 1 && cells == 3 ? FLAGS_BUS : PLAIN_BUS;
+}
+
+/* The PCI address space of a PCI address's first cell: 1 for I/O, 2 for memory, whether 32- or
+ * 64-bit, 0 for configuration. */
+static unsigned pci_space(uint32_t hi)
+{
+	unsigned space = hi >> 24 & 3;
+	return space == 3 ? 2 : space;
+}
+
+/* Entry index of a node's reg property, an address and size in its parent bus's address space. */
+static const char *reg_entry(const char *node, const char *root, unsigned index,
+			     uint32_t *hi, uint64_t *base, uint64_t *size)
+{
+	static uint32_t c[256];
+	char bus[PATH_MAX];
+	if (!format(bus, sizeof bus, "%s", node) || !up(bus, root)) return "GPIO controller is not in the device tree";
+	unsigned na = bus_cells(bus, root, "#address-cells"), ns = bus_cells(bus, root, "#size-cells");
+	long n = property_cells(node, "reg", c, sizeof c / sizeof c[0]);
+	if (na < 1 || na > 3 || ns < 1 || ns > 2 || n < (long)((index + 1) * (na + ns)) ||
+	    !address(c + index * (na + ns), na, hi, base) || !length(c + index * (na + ns) + na, ns, size))
+		return "cannot read the GPIO controller's reg property";
+	return NULL;
+}
+
+/* The CPU physical address and size of entry index of a node's reg property: the entry
+ * translated through the ranges of each bus above the node, as Linux translates it. */
+static const char *translate(const char *node, const char *root, unsigned index, uint64_t *base, uint64_t *size)
 {
 	static uint32_t c[4096];
 	char bus[PATH_MAX], parent[PATH_MAX];
+	uint32_t hi;
+	const char *why = reg_entry(node, root, index, &hi, base, size);
+	if (why) return why;
 	if (!format(bus, sizeof bus, "%s", node) || !up(bus, root)) return "GPIO controller is not in the device tree";
 	unsigned na = bus_cells(bus, root, "#address-cells"), ns = bus_cells(bus, root, "#size-cells");
-	uint32_t space;
-	long n = property_cells(node, "reg", c, sizeof c / sizeof c[0]);
-	if (n < (long)(na + ns) || !address(c, na, &space, base) || !length(c + na, ns, size))
-		return "cannot read the GPIO controller's reg property";
 	while (strcmp(bus, root)) {
 		if (!format(parent, sizeof parent, "%s", bus) || !up(parent, root)) return "device-tree path too long";
 		unsigned pna = bus_cells(parent, root, "#address-cells"), entry = na + pna + ns;
-		n = property_cells(bus, "ranges", c, sizeof c / sizeof c[0]);
+		enum bus_kind kind = bus_kind(bus);
+		long n = property_cells(bus, "ranges", c, sizeof c / sizeof c[0]);
 		if (n < 0) return "a bus above the GPIO controller has no ranges property, so its address cannot be translated";
-		if (n == 0) { if (pna != 3) space = 0; } /* empty ranges: the same addresses */
-		else {
+		if (n == 0) {
+			/* The same addresses; the flags cell passes through to a parent bus that has one. */
+			if (bus_kind(parent) == PLAIN_BUS) hi = 0;
+		} else {
 			bool found = false;
 			for (long i = 0; !found && i + (long)entry <= n; i += entry) {
-				uint32_t child_space, parent_space;
+				uint32_t child_hi, parent_hi;
 				uint64_t child, to, len;
-				if (!address(c + i, na, &child_space, &child) || !address(c + i + na, pna, &parent_space, &to) ||
+				if (!address(c + i, na, &child_hi, &child) || !address(c + i + na, pna, &parent_hi, &to) ||
 				    !length(c + i + na + pna, ns, &len))
 					return "cannot parse the ranges of a bus above the GPIO controller";
-				if ((child_space ^ space) & (na == 3 ? UINT32_C(0x03000000) : UINT32_MAX)) continue;
+				if (kind == PCI_BUS && pci_space(child_hi) != pci_space(hi)) continue;
+				if (kind == FLAGS_BUS && child_hi != hi) continue;
 				if (*base < child || *base - child >= len) continue;
 				if (__builtin_add_overflow(to, *base - child, base)) return "GPIO controller address overflows";
-				space = parent_space; found = true;
+				hi = parent_hi; found = true;
 			}
 			if (!found) return "GPIO controller address is outside the ranges of a bus above it";
 		}
@@ -242,37 +289,43 @@ static const char *translate(const char *node, const char *root, uint64_t *base,
 	return NULL;
 }
 
-/* The gpios property of the pps-gpio device behind a /sys/class/pps entry: ppsN name ->
- * platform device -> its device-tree node. pps-gpio names itself "<device>.<id>". */
-static const char *pps_gpios(const char *entry, uint32_t gpios[3])
+/* The device-tree node of the pps-gpio device behind a /sys/class/pps entry. pps-gpio names its
+ * source "<platform device>.<id>", and a platform device made from the device tree has id -1;
+ * a name that does not end in ".-1" is not one, or was cut short. */
+static const char *pps_node(const char *entry, char *node, size_t cap)
 {
-	char path[PATH_MAX], name[128];
+	char path[PATH_MAX], name[64], driver[PATH_MAX];
 	long n = -1;
 	if (format(path, sizeof path, "%s/class/pps/%s/name", sys_root, entry))
 		n = read_file(path, name, sizeof name - 1);
 	if (n <= 0) return "cannot read the PPS device name";
 	name[n] = 0;
 	name[strcspn(name, "\n")] = 0;
-	char *dot = strrchr(name, '.');
-	if (dot) *dot = 0;
-	if (!format(path, sizeof path, "%s/bus/platform/devices/%s/of_node", sys_root, name) ||
-	    property_cells(path, "gpios", gpios, 3) != 3)
-		return "PPS device has no device-tree GPIO";
+	size_t len = strlen(name);
+	if (len <= 3 || strcmp(name + len - 3, ".-1")) return "PPS device is not a pps-gpio device";
+	name[len - 3] = 0;
+	ssize_t d = format(path, sizeof path, "%s/bus/platform/devices/%s/driver", sys_root, name) ?
+		readlink(path, driver, sizeof driver - 1) : -1;
+	if (d < 0) return "PPS device is not a pps-gpio device";
+	driver[d] = 0;
+	const char *base = strrchr(driver, '/') ? strrchr(driver, '/') + 1 : driver;
+	if (strcmp(base, "pps-gpio")) return "PPS device is not a pps-gpio device";
+	if (!format(node, cap, "%s/bus/platform/devices/%s/of_node", sys_root, name)) return "PPS device name too long";
 	return NULL;
 }
 
 static int cmp_name(const void *a, const void *b) { return strcmp(a, b); }
 
-/* The one PPS device that has a device-tree GPIO, as /dev/ppsN; reports on stderr if there is not one. */
+/* The one pps-gpio device, as /dev/ppsN; reports on stderr if there is not exactly one. */
 static bool default_pps(char *path, size_t cap)
 {
-	char dir[PATH_MAX], names[16][NAME_MAX + 1];
+	static char names[64][NAME_MAX + 1];
+	char dir[PATH_MAX], node[PATH_MAX];
 	size_t count = 0;
 	DIR *d = format(dir, sizeof dir, "%s/class/pps", sys_root) ? opendir(dir) : NULL;
 	struct dirent *e;
 	while (d && (e = readdir(d))) {
-		uint32_t gpios[3];
-		if (e->d_name[0] == '.' || pps_gpios(e->d_name, gpios)) continue;
+		if (e->d_name[0] == '.' || pps_node(e->d_name, node, sizeof node)) continue;
 		if (count < sizeof names / sizeof names[0]) strcpy(names[count], e->d_name);
 		count++;
 	}
@@ -293,17 +346,19 @@ static bool default_pps(char *path, size_t cap)
 
 /* Find the GPIO controller and line that a PPS device uses: the controller is the gpiochip
  * whose device-tree node has the phandle in the PPS device's gpios property, and its backend
- * comes from the node's compatible strings. Returns NULL, or why not. */
+ * comes from the first of the node's compatible strings that a backend handles. Returns NULL,
+ * or why not. */
 static const char *locate(const char *pps, struct controller *ctl)
 {
-	static char why[512];
-	char real[PATH_MAX], root[PATH_MAX], dir[PATH_MAX], link[PATH_MAX], path[PATH_MAX], compatible[256];
+	static char why[512], compatible[4096];
+	char real[PATH_MAX], root[PATH_MAX], node[PATH_MAX], dir[PATH_MAX], link[PATH_MAX], path[PATH_MAX];
 	const char *dev = realpath(pps, real) ? real : pps;
 	const char *entry = strrchr(dev, '/') ? strrchr(dev, '/') + 1 : dev;
-	uint32_t gpios[3];
-	const char *error = pps_gpios(entry, gpios);
+	const char *error = pps_node(entry, node, sizeof node);
 	if (error) return error;
-	if (gpios[2] & 1) return "PPS GPIO is active low";
+	uint32_t gpios[64];
+	long ngpios = property_cells(node, "gpios", gpios, sizeof gpios / sizeof gpios[0]);
+	if (ngpios < 1) return "PPS device has no device-tree GPIO";
 	if (!realpath(dt_root, root)) return "cannot read the device tree";
 	DIR *d = format(dir, sizeof dir, "%s/bus/gpio/devices", sys_root) ? opendir(dir) : NULL;
 	if (!d) return "cannot read the GPIO controllers";
@@ -319,14 +374,20 @@ static const char *locate(const char *pps, struct controller *ctl)
 	ctl->root_len = strlen(root);
 	if (strncmp(ctl->node, root, ctl->root_len) || ctl->node[ctl->root_len] != '/')
 		return "PPS GPIO controller is outside the device tree";
+	/* Every backend's controller has two GPIO cells: the line, then flags. */
+	uint32_t cells;
+	if (property_cells(ctl->node, "#gpio-cells", &cells, 1) != 1 || cells != 2)
+		return "PPS GPIO controller does not have two GPIO cells";
+	if (ngpios < 3) return "PPS device's gpios property is too short";
+	if (gpios[2] & 1) return "PPS GPIO is active low";
 	long n = format(path, sizeof path, "%s/compatible", ctl->node) ? read_file(path, compatible, sizeof compatible - 1) : -1;
 	if (n <= 0) return "cannot read the PPS GPIO controller's compatible property";
 	compatible[n] = 0;
 	ctl->backend = NULL;
 	uint32_t count = 0;
-	for (size_t b = 0; !ctl->backend && b < sizeof backends / sizeof backends[0]; b++)
-		for (const struct compatible *c = backends[b]->compatible; !ctl->backend && c->name; c++)
-			for (long i = 0; !ctl->backend && i < n; i += (long)strlen(compatible + i) + 1)
+	for (long i = 0; !ctl->backend && i < n; i += (long)strlen(compatible + i) + 1)
+		for (size_t b = 0; !ctl->backend && b < sizeof backends / sizeof backends[0]; b++)
+			for (const struct compatible *c = backends[b]->compatible; !ctl->backend && c->name; c++)
 				if (!strcmp(compatible + i, c->name)) { ctl->backend = backends[b]; count = c->lines; }
 	if (!ctl->backend) {
 		for (long i = 0; i < n - 1; i++) if (!compatible[i]) compatible[i] = ' ';
@@ -353,56 +414,97 @@ struct source {
 	int64_t offset;
 	void *mapping;
 	size_t map_length;
-	volatile uint32_t *level;
+	uint64_t map_start;
+	const volatile uint32_t *level;
 	uint32_t mask;
 	const char *device;
-	uint64_t physical; /* address mapped through /dev/mem */
+	uint64_t physical; /* address of the input register, when read through /dev/mem */
 };
 
+/* The 32-bit register at offset address of fd, mapping only the page holding it, or, for a
+ * gpiomem device, the whole window, which is all its driver maps. A mapping already in s is
+ * reused if it holds the register, and otherwise replaced. Returns NULL after reporting why. */
+static const volatile uint32_t *map_register(struct source *s, int fd, uint64_t address, size_t window, long page)
+{
+	uint64_t start = window ? 0 : address - address % (uint64_t)page;
+	size_t length = window ? window : (size_t)page;
+	if (s->mapping && (s->map_start != start || s->map_length != length)) {
+		if (munmap(s->mapping, s->map_length) < 0) syserror("munmap");
+		s->mapping = NULL;
+	}
+	if (!s->mapping) {
+		void *m = mmap(NULL, length, PROT_READ, MAP_SHARED, fd, (off_t)start);
+		if (m == MAP_FAILED) {
+			int e = errno;
+			syserror(s->device);
+			if (e == EPERM && !strcmp(s->device, "/dev/mem"))
+				fprintf(stderr, "the kernel does not allow /dev/mem to map the GPIO controller's registers;\n"
+					"a kernel built with CONFIG_IO_STRICT_DEVMEM needs the boot parameter iomem=relaxed\n");
+			return NULL;
+		}
+		s->mapping = m; s->map_start = start; s->map_length = length;
+	}
+	return (const volatile uint32_t *)((const volatile char *)s->mapping + (address - start));
+}
+
+/* Map the register holding the PPS GPIO's input: read the backend's identification register,
+ * if it has one, and ask the backend where the input is. */
 static void map_registers(struct source *s, const struct controller *c)
 {
 	const struct backend *b = c->backend;
+	char root[PATH_MAX];
 	long page = sysconf(_SC_PAGESIZE);
 	if (page <= 0) { fail("cannot determine page size"); return; }
-	uint64_t physical = 0, span = b->window;
+	if (!realpath(dt_root, root)) { fail("cannot read the device tree"); return; }
+	uint64_t start = 0, size = 0; /* the register range: where it is in fd, and its length */
+	size_t window = 0;
+	const char *missing = NULL, *why = NULL;
 	int fd = -1;
 	if (b->device) {
 		s->device = b->device;
 		fd = open(s->device, O_RDONLY | O_SYNC | O_CLOEXEC);
+		if (fd < 0 && errno != ENOENT) { syserror(s->device); return; }
+		if (fd < 0) missing = b->device;
 	}
-	if (!b->device || (fd < 0 && errno == ENOENT)) {
-		char root[PATH_MAX];
-		uint64_t size;
-		const char *why = realpath(dt_root, root) ? translate(c->node, root, &physical, &size) : "cannot read the device tree";
-		if (why) { fail(why); return; }
-		if (!b->device) span = size;
-		s->device = "/dev/mem"; s->physical = physical;
-		fd = open(s->device, O_RDONLY | O_SYNC | O_CLOEXEC);
+	if (fd >= 0) {
+		/* The window starts at the first register range, in the same bus address space. */
+		uint32_t hi0, hi;
+		uint64_t base0, size0;
+		why = reg_entry(c->node, root, 0, &hi0, &base0, &size0);
+		if (!why) why = reg_entry(c->node, root, b->reg, &hi, &start, &size);
+		if (!why && (hi != hi0 || start < base0 || start - base0 > b->window || size > b->window - (start - base0)))
+			why = "GPIO controller's registers are not all in the gpiomem window";
+		start -= base0;
+		window = b->window;
+	} else {
+		why = translate(c->node, root, b->reg, &start, &size);
+		if (!why) {
+			s->device = "/dev/mem";
+			fd = open(s->device, O_RDONLY | O_SYNC | O_CLOEXEC);
+			if (fd < 0) syserror(s->device);
+		}
 	}
-	if (fd < 0) { syserror(s->device); return; }
-	size_t level = b->level(c->line, &s->mask);
-	if (level + 4 > span || b->extent > span) {
-		fail("GPIO controller registers are smaller than expected");
-		close(fd); return;
-	}
-	size_t displacement = physical % (uint64_t)page;
-	off_t offset = (off_t)(physical - displacement);
-	s->map_length = ((span + displacement + page - 1) / page) * page;
-	s->mapping = mmap(NULL, s->map_length, PROT_READ, MAP_SHARED, fd, offset);
-	if (s->mapping == MAP_FAILED) {
-		int e = errno;
-		s->mapping = NULL;
-		syserror(s->device);
-		if (e == EPERM && !strcmp(s->device, "/dev/mem"))
-			fprintf(stderr, "the kernel does not allow /dev/mem to map the GPIO controller's registers;\n"
-				"a kernel built with CONFIG_IO_STRICT_DEVMEM needs the boot parameter iomem=relaxed\n");
-	}
-	if (close(fd) < 0) syserror("close memory device");
-	if (!s->mapping) return;
-	const volatile char *regs = (const volatile char *)s->mapping + displacement;
-	s->level = (volatile uint32_t *)(regs + level);
-	const char *why = b->check ? b->check(regs) : NULL;
 	if (why) fail(why);
+	uint32_t id = 0;
+	if (!fatal && b->id >= 0) {
+		const volatile uint32_t *r = (uint64_t)b->id + 4 > size ? NULL : map_register(s, fd, start + (uint64_t)b->id, window, page);
+		if ((uint64_t)b->id + 4 > size) fail("GPIO controller's identification register is outside its register range");
+		else if (!r) fatal = true;
+		else id = *r;
+	}
+	size_t offset = 0;
+	if (!fatal && !b->input(id, c->line, &offset, &s->mask)) {
+		fprintf(stderr, "unsupported %s GPIO controller (identification register 0x%08" PRIx32 ")\n", b->name, id);
+		fatal = true;
+	}
+	if (!fatal && offset + 4 > size) fail("GPIO input register is outside the controller's register range");
+	if (!fatal) {
+		s->level = map_register(s, fd, start + offset, window, page);
+		if (!s->level) fatal = true;
+		else if (!window) s->physical = start + offset;
+	}
+	if (fd >= 0 && close(fd) < 0) syserror("close memory device");
+	if (fatal && missing) fprintf(stderr, "(%s does not exist, so /dev/mem was used)\n", missing);
 }
 
 static void request_line(struct source *s, const char *chip, unsigned gpio)

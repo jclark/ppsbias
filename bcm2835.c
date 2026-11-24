@@ -13,15 +13,17 @@ static const struct compatible compatible[] = {
 };
 
 /* The GPLEVn level registers: 32 lines per register, the first at 0x34. */
-static size_t level(unsigned line, uint32_t *mask)
+static bool input(uint32_t id, unsigned line, size_t *offset, uint32_t *mask)
 {
+	(void)id;
+	*offset = 0x34 + 4 * (line / 32);
 	*mask = UINT32_C(1) << line % 32;
-	return 0x34 + 4 * (line / 32);
+	return true;
 }
 
-/* /dev/gpiomem is the Raspberry Pi 3 and 4's gpiomem device. */
+/* /dev/gpiomem is the gpiomem device of the Raspberry Pi kernel for the Pi 3 and 4. */
 const struct backend bcm2835_backend = {
 	.name = "bcm2835", .compatible = compatible,
 	.device = "/dev/gpiomem", .window = 0x1000,
-	.level = level,
+	.reg = 0, .id = -1, .input = input,
 };
