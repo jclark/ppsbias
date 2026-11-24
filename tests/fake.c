@@ -92,6 +92,7 @@ void *fake_mmap(void *a, size_t len, int prot, int flags, int fd, off_t off)
 	/* A gpiomem device (102) maps from its start; /dev/mem (104) at the address, which fake.py checks. */
 	(void)a; assert(len <= sizeof registers && prot == PROT_READ && flags == MAP_SHARED);
 	assert((fd == 102 && off == 0) || fd == 104);
+	if (fd == 104 && is("io_strict")) { errno = EPERM; return MAP_FAILED; }
 	uint32_t version = is("rk_v1") ? 0 : 0x01000c2b; /* Rockchip GPIO_VERSION_ID */
 	memcpy(registers + 0x78, &version, 4);
 	uint32_t pid = is("ti_pid") ? 0x44822905 : 0x44832905; /* TI Keystone GPIO_PID */

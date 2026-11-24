@@ -79,9 +79,10 @@ ppsbias -c chip -g gpio [-t seconds] [-e] [-v] [-w ms] [-s ms]
 
 The first form is preferred: it reads the level of the PPS device's GPIO from the GPIO controller's registers while the PPS driver supplies timestamps.
 It finds the GPIO and its controller from the device tree.
-It supports the GPIO controllers of the Raspberry Pi 3, 4 and 5, Rockchip SoCs with GPIO v2 (such as the RK3566, RK3568 and RK3588) TI K3 SoCs (such as the AM67A on the BeagleY-AI) and NXP i.MX SoCs (such as the i.MX 8M Plus).
-On the Raspberry Pi the registers are read through `/dev/gpiomem` or `/dev/gpiomem0`, or `/dev/mem` if those are missing;
-on the others they are read through `/dev/mem`.
+It supports the GPIO controllers of the Raspberry Pi 3, 4 and 5, Rockchip SoCs with GPIO v2 (such as the RK3566, RK3568 and RK3588), TI K3 SoCs (such as the AM67A on the BeagleY-AI) and NXP i.MX SoCs (such as the i.MX 8M Plus).
+On the Raspberry Pi the registers are read through `/dev/gpiomem` or `/dev/gpiomem0`, which the Raspberry Pi kernel provides,
+or through `/dev/mem` if those are missing, as with a mainline kernel;
+on the others they are read through `/dev/mem`, which needs a suitable kernel configuration (see below).
 `-c` is the portable backup, using GPIO ioctl reads and GPIO-event timestamps.
 The events take a similar interrupt path to PPS, giving an order-of-magnitude estimate; the first form measures the actual PPS timestamps and usually gives much tighter polling brackets.
 
@@ -121,6 +122,28 @@ Print the configuration, individual observations and a final statistical summary
 
 `-h`\
 Show help.
+
+### Reading registers through /dev/mem
+
+Without a gpiomem device, `ppsbias` maps the page holding the GPIO controller's level register read-only from `/dev/mem`.
+That is always so on Rockchip, TI K3 and i.MX, and on a Raspberry Pi running a mainline kernel.
+This needs:
+
+* root, or more precisely `CAP_SYS_RAWIO`, to open `/dev/mem`;
+* a kernel with `CONFIG_DEVMEM`, which is not in kernel lockdown (as it may be under UEFI Secure Boot);
+* a kernel that allows `/dev/mem` to map registers a driver is using.
+  The GPIO controller is always in use by its driver, so a kernel built with `CONFIG_IO_STRICT_DEVMEM` refuses the mapping with "Operation not permitted",
+  unless it is booted with the kernel parameter `iomem=relaxed`.
+  `CONFIG_STRICT_DEVMEM` without `CONFIG_IO_STRICT_DEVMEM` is fine: it restricts `/dev/mem` to non-RAM ranges.
+
+To check the configuration of the running kernel:
+
+```
+grep STRICT_DEVMEM /boot/config-$(uname -r)
+```
+
+For example, the kernels of Raspberry Pi OS, the BeagleBoard.org Debian images and Armbian's `current-rockchip64` allow the mapping;
+Fedora's kernel (Fedora 45) has `CONFIG_IO_STRICT_DEVMEM` and needs `iomem=relaxed`.
 
 For accurate results, `ppsbias` needs to run on a different CPU from the one handling the PPS interrupt.
 Use

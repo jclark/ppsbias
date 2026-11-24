@@ -81,6 +81,8 @@ for pps, backend, device, controller, address in [
 for pps, address in [('fakepps', '0x1f000d0000'), ('ppsbcm', '0x3f200000'), ('pps2711', '0xfe200000')]:
     first = rows(run([fake, '-p', pps, '-t', '4', '-v'], 0, 'fallback'))[0]
     assert first['device'] == '/dev/mem' and first['address'] == address, first
+r = run([fake, '-p', 'ppsrk', '-t', '4'], 1, 'io_strict')
+assert 'Operation not permitted' in r.stderr and 'iomem=relaxed' in r.stderr and not r.stdout, r
 r = run([fake, '-p', 'ppsrk', '-t', '4'], 1, 'rk_v1')
 assert 'unsupported Rockchip GPIO controller version' in r.stderr, r
 r = run([fake, '-p', 'ppsk3', '-t', '4'], 1, 'ti_pid')

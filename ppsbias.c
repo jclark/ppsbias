@@ -389,7 +389,14 @@ static void map_registers(struct source *s, const struct controller *c)
 	off_t offset = (off_t)(physical - displacement);
 	s->map_length = ((span + displacement + page - 1) / page) * page;
 	s->mapping = mmap(NULL, s->map_length, PROT_READ, MAP_SHARED, fd, offset);
-	if (s->mapping == MAP_FAILED) { s->mapping = NULL; syserror(s->device); }
+	if (s->mapping == MAP_FAILED) {
+		int e = errno;
+		s->mapping = NULL;
+		syserror(s->device);
+		if (e == EPERM && !strcmp(s->device, "/dev/mem"))
+			fprintf(stderr, "the kernel does not allow /dev/mem to map the GPIO controller's registers;\n"
+				"a kernel built with CONFIG_IO_STRICT_DEVMEM needs the boot parameter iomem=relaxed\n");
+	}
 	if (close(fd) < 0) syserror("close memory device");
 	if (!s->mapping) return;
 	const volatile char *regs = (const volatile char *)s->mapping + displacement;
