@@ -7,7 +7,7 @@
  * of lines. */
 #include <inttypes.h>
 #include <stdio.h>
-#include "family.h"
+#include "backend.h"
 
 static const struct compatible compatible[] = {
 	{ "ti,keystone-gpio", 0 },
@@ -32,7 +32,7 @@ static const char *check(const volatile char *regs)
 	return why;
 }
 
-const struct family k3 = {
+const struct backend k3_backend = {
 	.name = "k3", .compatible = compatible, .lines_property = "ti,ngpio",
 	.level = level, .check = check, .extent = 4,
 };

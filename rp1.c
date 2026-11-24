@@ -3,7 +3,7 @@
  */
 /* The GPIO controller of the RP1, the I/O chip of the Raspberry Pi 5 and Compute Module 5, as
  * the kernel's pinctrl-rp1 driver handles it. */
-#include "family.h"
+#include "backend.h"
 
 static const struct compatible compatible[] = {
 	{ "raspberrypi,rp1-gpio", 54 },
@@ -21,7 +21,7 @@ static size_t level(unsigned line, uint32_t *mask)
 }
 
 /* /dev/gpiomem0 is the Raspberry Pi 5's gpiomem device for the RP1 GPIO controller. */
-const struct family rp1 = {
+const struct backend rp1_backend = {
 	.name = "rp1", .compatible = compatible,
 	.device = "/dev/gpiomem0", .window = 0x30000,
 	.level = level,

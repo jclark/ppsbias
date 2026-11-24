@@ -6,7 +6,7 @@
  * supported. */
 #include <inttypes.h>
 #include <stdio.h>
-#include "family.h"
+#include "backend.h"
 
 static const struct compatible compatible[] = {
 	{ "rockchip,gpio-bank", 32 },
@@ -31,7 +31,7 @@ static const char *check(const volatile char *regs)
 	return why;
 }
 
-const struct family rockchip = {
+const struct backend rockchip_backend = {
 	.name = "rockchip", .compatible = compatible,
 	.level = level, .check = check, .extent = 0x7c,
 };

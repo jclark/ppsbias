@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build a synthetic /sys and device tree under $1 for finding a PPS device's GPIO controller.
 #
-# GPIO controllers (phandle: family, node, CPU address of its first register range):
+# GPIO controllers (phandle: backend, node, CPU address of its first register range):
 #   7:    bcm2835 /soc/gpio@7e200000, Pi 3 bus ranges, 0x3f200000
 #   8:    bcm2711 /soc4/gpio@7e200000, Pi 4 bus ranges, 0xfe200000
 #   9:    rp1 /axi/pcie@1000120000/rp1/gpio@d0000, the Pi 5's PCIe ranges, 0x1f000d0000

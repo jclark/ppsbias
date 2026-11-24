@@ -25,7 +25,7 @@
 #include <sys/timepps.h>
 #include <time.h>
 #include <unistd.h>
-#include "families/family.h"
+#include "backend.h"
 
 #define NS INT64_C(1000000000)
 _Static_assert(sizeof(off_t) >= 8, "64-bit mmap offsets required");
@@ -107,12 +107,14 @@ static int64_t check_clocks(void)
 	return add(c.low, sub(c.high, c.low) / 2);
 }
 
-/* The supported GPIO controller families, each described in its own file under families/. */
-static const struct family *const families[] = { &bcm2835, &rp1, &rockchip, &k3, &mxc };
+/* The supported kinds of GPIO controller, each described by a backend in its own file. */
+static const struct backend *const backends[] = {
+	&bcm2835_backend, &rp1_backend, &rockchip_backend, &k3_backend, &mxc_backend
+};
 
 /* The GPIO a pps-gpio device uses. */
 struct controller {
-	const struct family *family;
+	const struct backend *backend;
 	char node[PATH_MAX]; /* filesystem path of the controller's device-tree node */
 	size_t root_len;     /* length of the device-tree root's path, a prefix of node */
 	unsigned line;
@@ -290,7 +292,7 @@ static bool default_pps(char *path, size_t cap)
 }
 
 /* Find the GPIO controller and line that a PPS device uses: the controller is the gpiochip
- * whose device-tree node has the phandle in the PPS device's gpios property, and its family
+ * whose device-tree node has the phandle in the PPS device's gpios property, and its backend
  * comes from the node's compatible strings. Returns NULL, or why not. */
 static const char *locate(const char *pps, struct controller *ctl)
 {
@@ -320,22 +322,22 @@ static const char *locate(const char *pps, struct controller *ctl)
 	long n = format(path, sizeof path, "%s/compatible", ctl->node) ? read_file(path, compatible, sizeof compatible - 1) : -1;
 	if (n <= 0) return "cannot read the PPS GPIO controller's compatible property";
 	compatible[n] = 0;
-	ctl->family = NULL;
+	ctl->backend = NULL;
 	uint32_t count = 0;
-	for (size_t f = 0; !ctl->family && f < sizeof families / sizeof families[0]; f++)
-		for (const struct compatible *c = families[f]->compatible; !ctl->family && c->name; c++)
-			for (long i = 0; !ctl->family && i < n; i += (long)strlen(compatible + i) + 1)
-				if (!strcmp(compatible + i, c->name)) { ctl->family = families[f]; count = c->lines; }
-	if (!ctl->family) {
+	for (size_t b = 0; !ctl->backend && b < sizeof backends / sizeof backends[0]; b++)
+		for (const struct compatible *c = backends[b]->compatible; !ctl->backend && c->name; c++)
+			for (long i = 0; !ctl->backend && i < n; i += (long)strlen(compatible + i) + 1)
+				if (!strcmp(compatible + i, c->name)) { ctl->backend = backends[b]; count = c->lines; }
+	if (!ctl->backend) {
 		for (long i = 0; i < n - 1; i++) if (!compatible[i]) compatible[i] = ' ';
 		format(why, sizeof why, "PPS GPIO controller %s is not supported (compatible: %s)",
 		       ctl->node + ctl->root_len, compatible);
 		return why;
 	}
-	if (!count && (!ctl->family->lines_property ||
-	    property_cells(ctl->node, ctl->family->lines_property, &count, 1) != 1)) {
+	if (!count && (!ctl->backend->lines_property ||
+	    property_cells(ctl->node, ctl->backend->lines_property, &count, 1) != 1)) {
 		format(why, sizeof why, "cannot read the PPS GPIO controller's %s property",
-		       ctl->family->lines_property ? ctl->family->lines_property : "line count");
+		       ctl->backend->lines_property ? ctl->backend->lines_property : "line count");
 		return why;
 	}
 	if (gpios[1] >= count) return "PPS GPIO is outside the controller range";
@@ -359,27 +361,27 @@ struct source {
 
 static void map_registers(struct source *s, const struct controller *c)
 {
-	const struct family *f = c->family;
+	const struct backend *b = c->backend;
 	long page = sysconf(_SC_PAGESIZE);
 	if (page <= 0) { fail("cannot determine page size"); return; }
-	uint64_t physical = 0, span = f->window;
+	uint64_t physical = 0, span = b->window;
 	int fd = -1;
-	if (f->device) {
-		s->device = f->device;
+	if (b->device) {
+		s->device = b->device;
 		fd = open(s->device, O_RDONLY | O_SYNC | O_CLOEXEC);
 	}
-	if (!f->device || (fd < 0 && errno == ENOENT)) {
+	if (!b->device || (fd < 0 && errno == ENOENT)) {
 		char root[PATH_MAX];
 		uint64_t size;
 		const char *why = realpath(dt_root, root) ? translate(c->node, root, &physical, &size) : "cannot read the device tree";
 		if (why) { fail(why); return; }
-		if (!f->device) span = size;
+		if (!b->device) span = size;
 		s->device = "/dev/mem"; s->physical = physical;
 		fd = open(s->device, O_RDONLY | O_SYNC | O_CLOEXEC);
 	}
 	if (fd < 0) { syserror(s->device); return; }
-	size_t level = f->level(c->line, &s->mask);
-	if (level + 4 > span || f->extent > span) {
+	size_t level = b->level(c->line, &s->mask);
+	if (level + 4 > span || b->extent > span) {
 		fail("GPIO controller registers are smaller than expected");
 		close(fd); return;
 	}
@@ -392,7 +394,7 @@ static void map_registers(struct source *s, const struct controller *c)
 	if (!s->mapping) return;
 	const volatile char *regs = (const volatile char *)s->mapping + displacement;
 	s->level = (volatile uint32_t *)(regs + level);
-	const char *why = f->check ? f->check(regs) : NULL;
+	const char *why = b->check ? b->check(regs) : NULL;
 	if (why) fail(why);
 }
 
@@ -755,7 +757,7 @@ static void configuration(const struct source *src, const struct controller *ctl
 	long slack = prctl(PR_GET_TIMERSLACK, 0UL, 0UL, 0UL, 0UL);
 	if (slack < 0) perror("PR_GET_TIMERSLACK (optional)");
 	if (!verbose) return;
-	printf("access=%s device=", ctl ? ctl->family->name : "ioctl"); escaped(src->device);
+	printf("access=%s device=", ctl ? ctl->backend->name : "ioctl"); escaped(src->device);
 	if (src->mapping && !strcmp(src->device, "/dev/mem")) printf(" address=0x%" PRIx64, src->physical);
 	if (ctl) { printf(" controller="); escaped(ctl->node + ctl->root_len); }
 	printf(" gpio=%u", gpio);

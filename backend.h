@@ -1,23 +1,24 @@
 /* SPDX-License-Identifier: MIT
  * Copyright (c) 2026 James Clark
  */
-/* The interface between ppsbias and the files describing a family of GPIO controllers, as the
- * kernel driver that handles them does: which device-tree nodes the family handles, how many
+/* The interface between ppsbias and a backend, which describes a kind of GPIO controller as
+ * the kernel driver that handles it does: which device-tree nodes the backend handles, how many
  * lines a controller has, where a line's level is read, and how the registers are mapped.
- * A family is pure: it reads nothing from the system, and is given what ppsbias finds there.
- * Adding a family is one new file here and one line in the families list in ppsbias.c. */
-#ifndef PPSBIAS_FAMILY_H
-#define PPSBIAS_FAMILY_H
+ * A backend is pure: it reads nothing from the system, and is given what ppsbias finds there.
+ * Adding a backend is one new file, one line in the backends list in ppsbias.c, and one word
+ * in BACKENDS in the Makefiles. */
+#ifndef PPSBIAS_BACKEND_H
+#define PPSBIAS_BACKEND_H
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-/* A device-tree compatible string the family handles, with the number of lines of a controller
+/* A device-tree compatible string the backend handles, with the number of lines of a controller
  * whose node has it; lines is 0 when the node's lines_property gives the number instead. */
 struct compatible { const char *name; unsigned lines; };
 
-struct family {
-	const char *name;                     /* the kernel's name for the family, such as "rp1" */
+struct backend {
+	const char *name;                     /* the name of the kernel's driver, such as "rp1" */
 	const struct compatible *compatible;  /* terminated by an entry whose name is NULL */
 	const char *lines_property;           /* the node property giving its number of lines, or NULL */
 	/* A gpiomem device that maps the controller's registers from the start of its first register
@@ -34,5 +35,5 @@ struct family {
 	size_t extent;
 };
 
-extern const struct family bcm2835, rp1, rockchip, k3, mxc;
+extern const struct backend bcm2835_backend, rp1_backend, rockchip_backend, k3_backend, mxc_backend;
 #endif

@@ -9,13 +9,13 @@ BINDIR = $(PREFIX)/bin
 INSTALL = install
 
 PROGRAMS = ppsbias ppsecho
-FAMILIES = $(wildcard families/*.c)
+BACKENDS = bcm2835.c rp1.c rockchip.c k3.c mxc.c
 
 .PHONY: all clean install uninstall check
 all: $(PROGRAMS)
 
-ppsbias: ppsbias.c $(FAMILIES) families/family.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ ppsbias.c $(FAMILIES) $(LDLIBS) -lm
+ppsbias: ppsbias.c $(BACKENDS) backend.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ ppsbias.c $(BACKENDS) $(LDLIBS) -lm
 
 ppsecho: ppsecho.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)

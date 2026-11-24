@@ -6,13 +6,13 @@ LDLIBS =
 PYTHON = python3
 
 PROGRAMS = unit fake clocks
-FAMILIES = $(wildcard ../families/*.c)
+BACKENDS = ../bcm2835.c ../rp1.c ../rockchip.c ../k3.c ../mxc.c
 
 .PHONY: all check clean
 all: $(PROGRAMS)
 
-$(PROGRAMS): %: %.c ../ppsbias.c $(FAMILIES) ../families/family.h
-	$(CC) $(CPPFLAGS) -I.. $(CFLAGS) $(LDFLAGS) -o $@ $< $(FAMILIES) $(LDLIBS) -lm
+$(PROGRAMS): %: %.c ../ppsbias.c $(BACKENDS) ../backend.h
+	$(CC) $(CPPFLAGS) -I.. $(CFLAGS) $(LDFLAGS) -o $@ $< $(BACKENDS) $(LDLIBS) -lm
 
 check: all
 	./unit

@@ -61,10 +61,10 @@ assert 'no GPIO PPS device found' in r.stderr and not r.stdout, r
 with tempfile.TemporaryDirectory() as empty:
     r = run_in(empty, [fake, '-t', '4'], 1)
     assert 'no GPIO PPS device found' in r.stderr, r
-# The family comes from the controller node's compatible strings. The registers are read through
-# the family's gpiomem device or, without one, through /dev/mem at the translated address of the
+# The backend comes from the controller node's compatible strings. The registers are read through
+# the backend's gpiomem device or, without one, through /dev/mem at the translated address of the
 # node's first register range.
-for pps, family, device, controller, address in [
+for pps, backend, device, controller, address in [
         ('fakepps', 'rp1', '/dev/gpiomem0', '/axi/pcie@1000120000/rp1/gpio@d0000', None),
         ('ppsbcm', 'bcm2835', '/dev/gpiomem', '/soc/gpio@7e200000', None),
         ('pps2711', 'bcm2835', '/dev/gpiomem', '/soc4/gpio@7e200000', None),
@@ -73,7 +73,7 @@ for pps, family, device, controller, address in [
         ('ppsmxc', 'mxc', '/dev/mem', '/soc@0/bus@30000000/gpio@30200000', '0x30200000')]:
     r = run([fake, '-p', pps, '-t', '4', '-v'])
     first = rows(r)[0]
-    assert first['access'] == family and first['device'] == device, first
+    assert first['access'] == backend and first['device'] == device, first
     assert first['controller'] == controller and first['gpio'] == '18', first
     assert first.get('address') == address, first
     assert 'median' in summary(r) and not r.stderr, r

@@ -4,7 +4,7 @@
 /* The GPIO controllers of NXP i.MX SoCs from the i.MX35 on, as the kernel's gpio-mxc driver
  * handles them: one controller per 32-line port. SoC-specific compatible strings, such as
  * fsl,imx8mp-gpio on the i.MX 8M Plus, are followed by fsl,imx35-gpio. */
-#include "family.h"
+#include "backend.h"
 
 static const struct compatible compatible[] = {
 	{ "fsl,imx35-gpio", 32 },
@@ -19,7 +19,7 @@ static size_t level(unsigned line, uint32_t *mask)
 }
 
 /* The controller has no identification register to check. */
-const struct family mxc = {
+const struct backend mxc_backend = {
 	.name = "mxc", .compatible = compatible,
 	.level = level,
 };
